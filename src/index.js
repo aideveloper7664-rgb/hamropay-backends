@@ -16,6 +16,7 @@ app.use('/api/payment-link', require('./routes/links'));
 app.use('/api/developer', require('./routes/developer'));
 app.use('/api/cashier', require('./routes/cashier'));
 app.use('/api/credits', require('./routes/credits'));
+app.use('/api/referral', require('./routes/referral'));
 
 // Health check
 app.get('/', (req, res) => {

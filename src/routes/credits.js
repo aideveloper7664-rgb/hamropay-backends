@@ -15,7 +15,6 @@ router.get('/balance', authMiddleware, async (req, res) => {
       .single();
 
     if (error && error.code === 'PGRST116') {
-      // Create credit account with 20 free credits
       const { data: newCredit } = await supabase
         .from('hamro_credits')
         .insert([{ merchant_id: req.merchant.id, balance: 20 }])
@@ -31,7 +30,7 @@ router.get('/balance', authMiddleware, async (req, res) => {
   }
 });
 
-// Purchase credits via own gateway
+// Purchase credits
 router.post('/purchase', authMiddleware, async (req, res) => {
   try {
     const { amount, utr } = req.body;
@@ -67,7 +66,9 @@ router.post('/purchase', authMiddleware, async (req, res) => {
     const currentBalance = credit?.balance || 0;
     const currentPurchased = credit?.total_purchased || 0;
 
-    // Add credits (1 INR = 1 Credit)
+    // Check if first purchase (for referral cashback)
+    const isFirstPurchase = currentPurchased === 0;
+
     if (credit) {
       await supabase
         .from('hamro_credits')
@@ -98,6 +99,12 @@ router.post('/purchase', authMiddleware, async (req, res) => {
         note: `Purchased ${amount} Hamro Credits`
       }]);
 
+    // Process referral cashback on first purchase
+    if (isFirstPurchase) {
+      const { processReferralCashback } = require('./referral');
+      await processReferralCashback(req.merchant.id, amount);
+    }
+
     return res.json({
       success: true,
       message: `${amount} Hamro Credits added successfully!`,
@@ -108,7 +115,7 @@ router.post('/purchase', authMiddleware, async (req, res) => {
   }
 });
 
-// Get credit transactions history
+// Get credit history
 router.get('/history', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
