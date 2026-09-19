@@ -102,12 +102,12 @@ router.delete('/:linkId', authMiddleware, async (req, res) => {
   try {
     const { error } = await supabase
       .from('payment_links')
-      .update({ status: 'inactive' })
+      .delete()
       .eq('link_id', req.params.linkId)
       .eq('merchant_id', req.merchant.id);
 
     if (error) throw error;
-    return res.json({ success: true, message: 'Link deactivated' });
+    return res.json({ success: true, message: 'Link deleted' });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
