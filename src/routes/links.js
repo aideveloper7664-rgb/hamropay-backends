@@ -13,6 +13,35 @@ router.post('/create', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Title and amount required' });
     }
 
+    // Check if merchant has active cashier
+    const { data: cashier } = await supabase
+      .from('cashier_accounts')
+      .select('id, upi_id, type')
+      .eq('merchant_id', req.merchant.id)
+      .eq('is_active', true)
+      .single();
+
+    if (!cashier) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please connect FamPay or Paytm account first to create payment links'
+      });
+    }
+
+    // Check Hamro Credit balance
+    const { data: credit } = await supabase
+      .from('hamro_credits')
+      .select('balance')
+      .eq('merchant_id', req.merchant.id)
+      .single();
+
+    if (!credit || credit.balance <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Insufficient Hamro Credits. Please purchase more credits.'
+      });
+    }
+
     const linkId = 'lnk_' + uuidv4().replace(/-/g, '').slice(0, 16);
 
     const { data, error } = await supabase
@@ -32,11 +61,17 @@ router.post('/create', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    const paymentUrl = `${process.env.FRONTEND_URL || 'https://hamropay-backends.onrender.com'}/pay/${linkId}`;
+    const paymentUrl = `${process.env.FRONTEND_URL || 'https://hamro-pay-kilj.vercel.app'}/pay/${linkId}`;
 
     return res.status(201).json({
       success: true,
-      data: { ...data, payment_url: paymentUrl }
+      data: {
+        ...data,
+        payment_url: paymentUrl,
+        upi_id: cashier.upi_id,
+        cashier_type: cashier.type,
+        qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${amount}&cu=INR`
+      }
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -56,7 +91,7 @@ router.get('/list', authMiddleware, async (req, res) => {
 
     const links = data.map(link => ({
       ...link,
-      payment_url: `${process.env.FRONTEND_URL || 'https://hamropay-backends.onrender.com'}/pay/${link.link_id}`
+      payment_url: `${process.env.FRONTEND_URL || 'https://hamro-pay-kilj.vercel.app'}/pay/${link.link_id}`
     }));
 
     return res.json({ success: true, data: links });
@@ -65,12 +100,12 @@ router.get('/list', authMiddleware, async (req, res) => {
   }
 });
 
-// Get single link (public - customer facing)
+// Get single link (public)
 router.get('/:linkId', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('payment_links')
-      .select('*, merchants(name)')
+      .select('*, merchants(name, id, api_key)')
       .eq('link_id', req.params.linkId)
       .eq('status', 'active')
       .single();
@@ -79,17 +114,21 @@ router.get('/:linkId', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Payment link not found' });
     }
 
-    const { data: settings } = await supabase
-      .from('settings')
-      .select('fampay_upi, fampay_qr')
+    // Get merchant active cashier
+    const { data: cashier } = await supabase
+      .from('cashier_accounts')
+      .select('upi_id, type')
+      .eq('merchant_id', data.merchants.id)
+      .eq('is_active', true)
       .single();
 
     return res.json({
       success: true,
       data: {
         ...data,
-        upi_id: settings?.fampay_upi || '',
-        qr_code: settings?.fampay_qr || ''
+        upi_id: cashier?.upi_id || '',
+        cashier_type: cashier?.type || '',
+        qr_code: cashier ? `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${data.amount}&cu=INR` : ''
       }
     });
   } catch (err) {
@@ -97,7 +136,7 @@ router.get('/:linkId', async (req, res) => {
   }
 });
 
-// Delete/Deactivate link
+// Delete link
 router.delete('/:linkId', authMiddleware, async (req, res) => {
   try {
     const { error } = await supabase
@@ -113,7 +152,7 @@ router.delete('/:linkId', authMiddleware, async (req, res) => {
   }
 });
 
-// Verify payment for link (customer submits UTR)
+// Verify payment for link
 router.post('/:linkId/verify', async (req, res) => {
   try {
     const { utr, amount } = req.body;
@@ -144,19 +183,60 @@ router.post('/:linkId/verify', async (req, res) => {
       return res.status(400).json({ success: false, message: 'UTR already used' });
     }
 
-    // Verify UTR in Gmail
-    const gmailService = require('../services/gmail.service');
+    // Get merchant cashier
+    const { data: cashier } = await supabase
+      .from('cashier_accounts')
+      .select('*')
+      .eq('merchant_id', link.merchants.id)
+      .eq('is_active', true)
+      .single();
+
+    // Verify UTR
+    let verified = null;
     const payAmount = amount || link.amount;
-    const verified = await gmailService.verifyUTR(utr, payAmount);
+
+    if (cashier && cashier.type === 'fampay' && cashier.gmail_app_password) {
+      const crypto = require('crypto');
+      const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
+      const [ivHex, encrypted] = cashier.gmail_app_password.split(':');
+      const iv = Buffer.from(ivHex, 'hex');
+      const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+
+      const gmailService = require('../services/gmail.service');
+      verified = await gmailService.verifyUTRWithCredentials(
+        utr, payAmount, cashier.gmail_email, decrypted
+      );
+    } else {
+      const gmailService = require('../services/gmail.service');
+      verified = await gmailService.verifyUTR(utr, payAmount);
+    }
 
     if (!verified) {
       return res.status(400).json({ success: false, message: 'Payment not found. Check UTR and try again.' });
     }
 
     const merchant = link.merchants;
-    const commission = (payAmount * merchant.commission) / 100;
+    const commissionPercent = merchant.commission || 2;
+    const commission = (payAmount * commissionPercent) / 100;
     const netAmount = payAmount - commission;
 
+    // Check Hamro Credit
+    const { data: credit } = await supabase
+      .from('hamro_credits')
+      .select('balance, total_spent')
+      .eq('merchant_id', merchant.id)
+      .single();
+
+    if (!credit || credit.balance < commission) {
+      return res.status(400).json({
+        success: false,
+        message: 'Insufficient Hamro Credits. Please purchase more credits.'
+      });
+    }
+
+    // Create order record
     const orderId = 'ORD_' + uuidv4().replace(/-/g, '').toUpperCase().slice(0, 16);
 
     const { data: order } = await supabase
@@ -172,6 +252,7 @@ router.post('/:linkId/verify', async (req, res) => {
       .select()
       .single();
 
+    // Save transaction
     await supabase.from('transactions').insert([{
       order_id: order.id,
       merchant_id: merchant.id,
@@ -182,6 +263,7 @@ router.post('/:linkId/verify', async (req, res) => {
       gmail_message_id: verified.messageId
     }]);
 
+    // Credit Hamro Cash (wallet)
     const { data: wallet } = await supabase
       .from('wallets')
       .select('balance, total_earned')
@@ -194,11 +276,29 @@ router.post('/:linkId/verify', async (req, res) => {
       updated_at: new Date().toISOString()
     }).eq('merchant_id', merchant.id);
 
+    // Deduct Hamro Credit
+    await supabase.from('hamro_credits').update({
+      balance: credit.balance - commission,
+      total_spent: (credit.total_spent || 0) + commission,
+      updated_at: new Date().toISOString()
+    }).eq('merchant_id', merchant.id);
+
+    // Save credit transaction
+    await supabase.from('credit_transactions').insert([{
+      merchant_id: merchant.id,
+      type: 'deduct',
+      amount: commission,
+      order_id: orderId,
+      note: `Commission for link ${req.params.linkId}`
+    }]);
+
+    // Update link stats
     await supabase.from('payment_links').update({
       total_collected: (link.total_collected || 0) + payAmount,
       total_orders: (link.total_orders || 0) + 1
     }).eq('link_id', req.params.linkId);
 
+    // Fire webhook
     if (merchant.webhook_url) {
       fetch(merchant.webhook_url, {
         method: 'POST',
@@ -209,7 +309,8 @@ router.post('/:linkId/verify', async (req, res) => {
           link_id: req.params.linkId,
           utr,
           amount: payAmount,
-          net_amount: netAmount
+          net_amount: netAmount,
+          commission
         })
       }).catch(() => {});
     }
@@ -217,7 +318,7 @@ router.post('/:linkId/verify', async (req, res) => {
     return res.json({
       success: true,
       message: 'Payment verified!',
-      data: { order_id: orderId, utr, amount: payAmount, net_amount: netAmount }
+      data: { order_id: orderId, utr, amount: payAmount, net_amount: netAmount, commission }
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });

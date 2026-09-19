@@ -34,6 +34,22 @@ router.post('/register', async (req, res) => {
     // Create wallet for merchant
     await supabase.from('wallets').insert([{ merchant_id: merchant.id }]);
 
+    // Auto 20 Hamro Credit on register
+    await supabase.from('hamro_credits').insert([{
+      merchant_id: merchant.id,
+      balance: 20,
+      total_purchased: 0,
+      total_spent: 0
+    }]);
+
+    // Auto credit transaction record
+    await supabase.from('credit_transactions').insert([{
+      merchant_id: merchant.id,
+      type: 'purchase',
+      amount: 20,
+      note: 'Welcome bonus — 20 free Hamro Credits'
+    }]);
+
     return res.status(201).json({
       success: true,
       message: 'Merchant registered successfully',
