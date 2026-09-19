@@ -96,8 +96,35 @@ router.post('/verify', authMiddleware, async (req, res) => {
     }
 
     // Verify UTR in Gmail
-    const gmailService = require('../services/gmail.service');
-    const verified = await gmailService.verifyUTR(utr, order.amount);
+    // Check if merchant has active cashier
+    const { data: cashier } = await supabase
+      .from('cashier_accounts')
+      .select('*')
+      .eq('merchant_id', req.merchant.id)
+      .eq('is_active', true)
+      .single();
+
+    let verified = null;
+
+    if (cashier && cashier.type === 'fampay' && cashier.gmail_app_password) {
+      // Use merchant's own Gmail
+      const crypto = require('crypto');
+      const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
+      const [ivHex, encrypted] = cashier.gmail_app_password.split(':');
+      const iv = Buffer.from(ivHex, 'hex');
+      const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+
+      const merchantGmailService = require('../services/gmail.service');
+      verified = await merchantGmailService.verifyUTRWithCredentials(
+        utr, order.amount, cashier.gmail_email, decrypted
+      );
+    } else {
+      // Use admin Gmail (fallback)
+      const gmailService = require('../services/gmail.service');
+      verified = await gmailService.verifyUTR(utr, order.amount);
+    }
 
     if (!verified) {
       return res.status(400).json({ success: false, message: 'Payment not found. Check UTR and try again.' });
