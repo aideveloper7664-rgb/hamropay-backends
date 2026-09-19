@@ -14,6 +14,8 @@ app.use('/wallet', require('./routes/wallet'));
 app.use('/admin', require('./routes/admin'));
 app.use('/api/payment-link', require('./routes/links'));
 app.use('/api/developer', require('./routes/developer'));
+app.use('/api/cashier', require('./routes/cashier'));
+app.use('/api/credits', require('./routes/credits'));
 
 // Health check
 app.get('/', (req, res) => {
