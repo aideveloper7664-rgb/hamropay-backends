@@ -1,3 +1,9 @@
+const express = require('express');
+const router = express.Router();
+const supabase = require('../config/supabase');
+const { authMiddleware } = require('../middleware/auth');
+const { adminMiddleware } = require('../middleware/auth');
+
 // Upgrade plan via Hamro Cash
 router.post('/upgrade', authMiddleware, async (req, res) => {
   try {
