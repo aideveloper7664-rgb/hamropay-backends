@@ -17,10 +17,12 @@ app.use('/api/developer', require('./routes/developer'));
 app.use('/api/cashier', require('./routes/cashier'));
 app.use('/api/credits', require('./routes/credits'));
 app.use('/api/referral', require('./routes/referral'));
+app.use('/api/plans', require('./routes/plans'));
+app.use('/api/promo', require('./routes/promo'));
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ name: 'HamroPay API', version: '1.0.0', status: 'running' });
+  res.json({ name: 'HamroPay API', version: '2.0.0', status: 'running' });
 });
 
 const PORT = process.env.PORT || 3000;

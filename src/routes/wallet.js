@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
+const { checkPlanLimits } = require('./plans');
 
 // Get Wallet Balance
 router.get('/balance', authMiddleware, async (req, res) => {
@@ -14,11 +15,20 @@ router.get('/balance', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
+    // Get plan info
+    const { data: merchantPlan } = await supabase
+      .from('merchant_plans')
+      .select('*, plans(*)')
+      .eq('merchant_id', req.merchant.id)
+      .single();
+
     return res.json({
       success: true,
       data: {
         balance: wallet.balance || 0,
-        total_earned: wallet.total_earned || 0
+        total_earned: wallet.total_earned || 0,
+        wallet_limit: merchantPlan?.plans?.wallet_limit || 500,
+        plan_name: merchantPlan?.plan_name || 'Blaze'
       }
     });
   } catch (err) {
@@ -37,7 +47,6 @@ router.get('/transactions', authMiddleware, async (req, res) => {
       .limit(50);
 
     if (error) throw error;
-
     return res.json({ success: true, data: transactions });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -47,10 +56,24 @@ router.get('/transactions', authMiddleware, async (req, res) => {
 // Withdraw Request
 router.post('/withdraw', authMiddleware, async (req, res) => {
   try {
-    const { amount, upi_id } = req.body;
+    const { amount, upi_id, method, bank_name, account_number, ifsc_code, account_holder } = req.body;
 
-    if (!amount || !upi_id) {
-      return res.status(400).json({ success: false, message: 'Amount and UPI ID required' });
+    if (!amount) {
+      return res.status(400).json({ success: false, message: 'Amount required' });
+    }
+
+    if (method === 'upi' && !upi_id) {
+      return res.status(400).json({ success: false, message: 'UPI ID required' });
+    }
+
+    if (method === 'bank' && (!bank_name || !account_number || !ifsc_code || !account_holder)) {
+      return res.status(400).json({ success: false, message: 'All bank details required' });
+    }
+
+    // Check plan withdrawal limits
+    const limitCheck = await checkPlanLimits(req.merchant.id, 'withdraw');
+    if (!limitCheck.allowed) {
+      return res.status(400).json({ success: false, message: limitCheck.message });
     }
 
     // Get settings for min withdrawal
@@ -87,7 +110,12 @@ router.post('/withdraw', authMiddleware, async (req, res) => {
       .insert([{
         merchant_id: req.merchant.id,
         amount,
-        upi_id,
+        upi_id: method === 'upi' ? upi_id : null,
+        method: method || 'upi',
+        bank_name: method === 'bank' ? bank_name : null,
+        account_number: method === 'bank' ? account_number : null,
+        ifsc_code: method === 'bank' ? ifsc_code : null,
+        account_holder: method === 'bank' ? account_holder : null,
         status: 'pending'
       }])
       .select()
@@ -110,7 +138,7 @@ router.post('/withdraw', authMiddleware, async (req, res) => {
       data: {
         withdrawal_id: withdrawal.id,
         amount,
-        upi_id,
+        method: method || 'upi',
         status: 'pending'
       }
     });
@@ -129,7 +157,6 @@ router.get('/withdrawals', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) throw error;
-
     return res.json({ success: true, data: withdrawals });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
