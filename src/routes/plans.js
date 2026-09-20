@@ -103,4 +103,42 @@ router.post('/upgrade', authMiddleware, async (req, res) => {
   }
 });
 module.exports = router;
+
+
+const checkPlanLimits = async (merchant_id, action) => {
+  const { data: merchantPlan } = await supabase
+    .from('merchant_plans')
+    .select('*, plans(*)')
+    .eq('merchant_id', merchant_id)
+    .single();
+
+  if (!merchantPlan) return { allowed: true };
+
+  const plan = merchantPlan.plans;
+
+  if (action === 'create_link') {
+    if (plan.links_limit !== -1 && merchantPlan.links_used >= plan.links_limit) {
+      return { allowed: false, message: `Payment link limit reached (${plan.links_limit}/month). Upgrade your plan.` };
+    }
+  }
+
+  if (action === 'withdraw') {
+    const weeklyLimit = plan.withdrawal_per_week;
+    if (weeklyLimit !== -1) {
+      const weekStart = new Date();
+      weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+      const { data: weeklyWithdrawals } = await supabase
+        .from('withdrawals')
+        .select('id')
+        .eq('merchant_id', merchant_id)
+        .gte('created_at', weekStart.toISOString());
+
+      if (weeklyWithdrawals && weeklyWithdrawals.length >= weeklyLimit) {
+        return { allowed: false, message: `Weekly withdrawal limit reached (${weeklyLimit}/week). Upgrade your plan.` };
+      }
+    }
+  }
+
+  return { allowed: true, plan, merchantPlan };
+};
 module.exports.checkPlanLimits = checkPlanLimits;
