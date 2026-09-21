@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
-const { google } = require('googleapis');
 require('dotenv').config();
 
 // Get all cashier accounts
@@ -41,24 +40,6 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Max 3 FamPay accounts allowed' });
     }
 
-    // Verify Gmail App Password
-    try {
-      const oauth2Client = new google.auth.OAuth2();
-      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-      const transporter = require('nodemailer').createTransport({
-        service: 'gmail',
-        auth: {
-          user: gmail_email,
-          pass: gmail_app_password
-        }
-      });
-
-      await transporter.verify();
-    } catch (gmailErr) {
-      return res.status(400).json({ success: false, message: 'Invalid Email or App Password. Please generate a new App Password and try again.' });
-    }
-
     // Encrypt app password
     const crypto = require('crypto');
     const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
@@ -78,7 +59,7 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
         phone,
         gmail_email,
         gmail_app_password: encryptedPass,
-        is_active: existing.length === 0,
+        is_active: !existing || existing.length === 0,
         is_verified: true
       }])
       .select('id, type, upi_id, phone, gmail_email, is_active, is_verified')
@@ -86,7 +67,11 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    return res.json({ success: true, data, message: 'FamPay account connected successfully' });
+    return res.json({
+      success: true,
+      data,
+      message: 'FamPay account connected successfully'
+    });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -101,7 +86,6 @@ router.post('/paytm/add', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'UPI ID and phone required' });
     }
 
-    // Check max 3 accounts
     const { data: existing } = await supabase
       .from('cashier_accounts')
       .select('id')
@@ -120,7 +104,7 @@ router.post('/paytm/add', authMiddleware, async (req, res) => {
         upi_id,
         phone,
         paytm_mid: paytm_mid || null,
-        is_active: existing.length === 0,
+        is_active: !existing || existing.length === 0,
         is_verified: true
       }])
       .select('id, type, upi_id, phone, is_active, is_verified')
@@ -128,7 +112,11 @@ router.post('/paytm/add', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    return res.json({ success: true, data, message: 'Paytm account connected successfully' });
+    return res.json({
+      success: true,
+      data,
+      message: 'Paytm account connected successfully'
+    });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -139,14 +127,12 @@ router.patch('/:id/toggle', authMiddleware, async (req, res) => {
   try {
     const { type } = req.body;
 
-    // Deactivate all of same type
     await supabase
       .from('cashier_accounts')
       .update({ is_active: false })
       .eq('merchant_id', req.merchant.id)
       .eq('type', type);
 
-    // Activate selected
     const { error } = await supabase
       .from('cashier_accounts')
       .update({ is_active: true })
@@ -176,7 +162,7 @@ router.delete('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Get active cashier for payment
+// Get active cashier
 router.get('/active', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
