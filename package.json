@@ -30,6 +30,7 @@
     "googleapis": "^181.0.0",
     "imap-simple": "^5.1.0",
     "jsonwebtoken": "^9.0.3",
+    "mailparser": "^3.9.28",
     "nodemailer": "^10.0.10",
     "uuid": "^14.0.2"
   }

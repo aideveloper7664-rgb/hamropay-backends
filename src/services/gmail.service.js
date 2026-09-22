@@ -1,131 +1,172 @@
-const { google } = require('googleapis');
+const imapSimple = require('imap-simple');
+const { simpleParser } = require('mailparser');
 require('dotenv').config();
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GMAIL_CLIENT_ID,
-  process.env.GMAIL_CLIENT_SECRET,
-  process.env.GMAIL_REDIRECT_URI
-);
+// Connect to Gmail via IMAP
+const connectIMAP = async (email, password) => {
+  const config = {
+    imap: {
+      user: email,
+      password: password.replace(/\s/g, ''),
+      host: 'imap.gmail.com',
+      port: 993,
+      tls: true,
+      tlsOptions: { rejectUnauthorized: false },
+      authTimeout: 10000,
+      connTimeout: 15000
+    }
+  };
+  return await imapSimple.connect(config);
+};
 
-oauth2Client.setCredentials({
-  refresh_token: process.env.GMAIL_REFRESH_TOKEN
-});
+// Verify UTR using admin Gmail
+const verifyUTR = async (utr, amount, sinceTs = null) => {
+  return await verifyUTRWithCredentials(
+    utr,
+    amount,
+    process.env.GMAIL_USER_EMAIL,
+    process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_REFRESH_TOKEN,
+    sinceTs
+  );
+};
 
-const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-const verifyUTR = async (utr, amount) => {
+// Verify UTR using merchant Gmail
+const verifyUTRWithCredentials = async (utr, amount, gmailEmail, appPassword, sinceTs = null) => {
+  let connection = null;
   try {
-    // Search FamPay emails in last 30 min
-    const query = `from:noreply@fampay.in subject:"successfully received" newer_than:1h`;
+    connection = await connectIMAP(gmailEmail, appPassword);
+    await connection.openBox('INBOX');
 
-    const { data } = await gmail.users.messages.list({
-      userId: 'me',
-      q: query,
-      maxResults: 20
-    });
+    // Same as PHP script — narrow to FamX subject
+    const searchCriteria = [['SUBJECT', 'FamX account']];
+    const fetchOptions = {
+      bodies: ['TEXT', 'HEADER'],
+      markSeen: false,
+      struct: true
+    };
 
-    if (!data.messages || data.messages.length === 0) {
+    const messages = await connection.search(searchCriteria, fetchOptions);
+    connection.end();
+
+    if (!messages || messages.length === 0) {
       return null;
     }
 
-    // Check each email
-    for (const msg of data.messages) {
-      const { data: email } = await gmail.users.messages.get({
-        userId: 'me',
-        id: msg.id,
-        format: 'full'
-      });
+    // Last 30 emails — newest first (same as PHP rsort)
+    const recent = messages.slice(-30).reverse();
 
-      const body = getEmailBody(email);
+    for (const msg of recent) {
+      // Get email timestamp
+      const headerPart = msg.parts.find(p => p.which === 'HEADER');
+      const emailDate = headerPart?.body?.date?.[0];
+      const emailTs = emailDate ? Math.floor(new Date(emailDate).getTime() / 1000) : null;
 
-      // Check UTR match
-      if (body.includes(utr)) {
-        // Check amount match
-        const amountMatch = body.match(/₹\s*([\d,]+\.?\d*)/);
-        if (amountMatch) {
-          const emailAmount = parseFloat(amountMatch[1].replace(',', ''));
-          if (emailAmount === parseFloat(amount)) {
-            return { messageId: msg.id, verified: true };
-          }
-        }
-      }
+      // Reject old emails — same as PHP (90 sec buffer)
+      if (sinceTs && emailTs && emailTs < (sinceTs - 90)) continue;
+
+      // Get body
+      const textPart = msg.parts.find(p => p.which === 'TEXT');
+      if (!textPart) continue;
+
+      let body = textPart.body || '';
+
+      // Decode base64 if needed
+      try {
+        const decoded = Buffer.from(body, 'base64').toString('utf8');
+        if (decoded.length > 0) body = decoded;
+      } catch (e) {}
+
+      // Strip HTML tags
+      body = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+      // Amount pattern — same as PHP: "received ₹X"
+      const amountMatch = body.match(/received\s+(?:₹|Rs\.?)\s*([\d,]+(?:\.\d+)?)/ui);
+      if (!amountMatch) continue;
+
+      const emailAmount = parseFloat(amountMatch[1].replace(',', ''));
+      if (Math.abs(emailAmount - parseFloat(amount)) > 0.009) continue;
+
+      // UTR pattern — same as PHP
+      let extractedUTR = null;
+      const utrMatch = body.match(/UTR[:\s]+(\d+)/i);
+      if (utrMatch) extractedUTR = utrMatch[1];
+
+      // Txn ID pattern — same as PHP
+      let txnId = null;
+      const txnMatch = body.match(/transaction\s+id\s+([A-Z0-9]+)/i);
+      if (txnMatch) txnId = txnMatch[1];
+
+      const identifier = extractedUTR || txnId;
+      if (!identifier) continue;
+
+      // Match UTR — same as PHP mode=utr
+      const typed = utr;
+      const matches = (extractedUTR === typed) || (txnId === typed) || body.includes(typed);
+      if (!matches) continue;
+
+      // Extract sender name — same as PHP
+      const senderMatch = body.match(/from\s+([A-Za-z][A-Za-z0-9\s]{1,40}?)\s+at\s+\d/ui);
+      const sender = senderMatch ? senderMatch[1].trim() : 'Unknown';
+
+      return {
+        messageId: msg.attributes.uid,
+        verified: true,
+        utr: identifier,
+        amount: emailAmount,
+        sender
+      };
     }
 
     return null;
   } catch (err) {
-    console.error('Gmail verify error:', err.message);
+    console.error('Gmail IMAP verify error:', err.message);
+    if (connection) {
+      try { connection.end(); } catch(e) {}
+    }
     return null;
   }
 };
 
-const getEmailBody = (email) => {
-  let body = '';
-
-  if (email.payload.parts) {
-    for (const part of email.payload.parts) {
-      if (part.mimeType === 'text/plain' || part.mimeType === 'text/html') {
-        if (part.body.data) {
-          body += Buffer.from(part.body.data, 'base64').toString('utf-8');
-        }
-      }
-    }
-  } else if (email.payload.body.data) {
-    body = Buffer.from(email.payload.body.data, 'base64').toString('utf-8');
-  }
-
-  return body;
-};
-
-module.exports = { verifyUTR };
-const verifyUTRWithCredentials = async (utr, amount, gmailEmail, appPassword) => {
+// Verify Paytm payment via Paytm API
+const verifyPaytmPayment = async (mid, orderId, expectedAmount) => {
   try {
-    const nodemailer = require('nodemailer');
-    const Imap = require('imap-simple');
+    const https = require('https');
+    const JsonData = JSON.stringify({ MID: mid, ORDERID: orderId });
 
-    const config = {
-      imap: {
-        user: gmailEmail,
-        password: appPassword,
-        host: 'imap.gmail.com',
-        port: 993,
-        tls: true,
-        authTimeout: 10000
-      }
-    };
-
-    const connection = await Imap.connect(config);
-    await connection.openBox('INBOX');
-
-    const searchCriteria = [
-      'UNSEEN',
-      ['FROM', 'noreply@fampay.in'],
-      ['SINCE', new Date(Date.now() - 60 * 60 * 1000)]
-    ];
-
-    const fetchOptions = { bodies: ['TEXT', 'HEADER'], markSeen: false };
-    const messages = await connection.search(searchCriteria, fetchOptions);
-
-    for (const msg of messages) {
-      const body = msg.parts.find(p => p.which === 'TEXT');
-      if (body && body.body.includes(utr)) {
-        const amountMatch = body.body.match(/₹\s*([\d,]+\.?\d*)/);
-        if (amountMatch) {
-          const emailAmount = parseFloat(amountMatch[1].replace(',', ''));
-          if (emailAmount === parseFloat(amount)) {
-            connection.end();
-            return { messageId: msg.attributes.uid, verified: true };
+    return new Promise((resolve, reject) => {
+      const url = `https://securegw.paytm.in/order/status?JsonData=${encodeURIComponent(JsonData)}`;
+      
+      https.get(url, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            const response = JSON.parse(data);
+            if (
+              response.STATUS === 'TXN_SUCCESS' &&
+              response.MID === mid &&
+              response.ORDERID === orderId &&
+              Math.abs(parseFloat(response.TXNAMOUNT) - parseFloat(expectedAmount)) < 0.01
+            ) {
+              resolve({
+                verified: true,
+                utr: response.BANKTXNID,
+                amount: parseFloat(response.TXNAMOUNT),
+                txnId: response.TXNID
+              });
+            } else {
+              resolve(null);
+            }
+          } catch (e) {
+            reject(e);
           }
-        }
-      }
-    }
-
-    connection.end();
-    return null;
+        });
+      }).on('error', reject);
+    });
   } catch (err) {
-    console.error('Merchant Gmail verify error:', err.message);
-    // Fallback to admin Gmail
-    return await verifyUTR(utr, amount);
+    console.error('Paytm verify error:', err.message);
+    return null;
   }
 };
 
-module.exports = { verifyUTR, verifyUTRWithCredentials };
+module.exports = { verifyUTR, verifyUTRWithCredentials, verifyPaytmPayment };
