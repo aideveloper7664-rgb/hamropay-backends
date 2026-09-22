@@ -1,22 +1,29 @@
 const imapSimple = require('imap-simple');
-const { simpleParser } = require('mailparser');
 require('dotenv').config();
 
-// Connect to Gmail via IMAP
 const connectIMAP = async (email, password) => {
-  const config = {
-    imap: {
-      user: email,
-      password: password.replace(/\s/g, ''),
-      host: 'imap.gmail.com',
-      port: 993,
-      tls: true,
-      tlsOptions: { rejectUnauthorized: false },
-      authTimeout: 10000,
-      connTimeout: 15000
+  const configs = [
+    { host: 'imap.gmail.com', port: 993, tls: true, tlsOptions: { rejectUnauthorized: false } },
+    { host: 'imap.gmail.com', port: 993, tls: true },
+  ];
+
+  for (const imapConfig of configs) {
+    try {
+      const connection = await imapSimple.connect({
+        imap: {
+          user: email,
+          password: password.replace(/\s/g, ''),
+          authTimeout: 10000,
+          connTimeout: 15000,
+          ...imapConfig
+        }
+      });
+      return connection;
+    } catch (e) {
+      continue;
     }
-  };
-  return await imapSimple.connect(config);
+  }
+  throw new Error('IMAP connection failed');
 };
 
 // Verify UTR using admin Gmail
@@ -26,42 +33,49 @@ const verifyUTR = async (utr, amount, sinceTs = null) => {
     amount,
     process.env.GMAIL_USER_EMAIL,
     process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_REFRESH_TOKEN,
-    sinceTs
+    sinceTs,
+    'fampay'
   );
 };
 
 // Verify UTR using merchant Gmail
-const verifyUTRWithCredentials = async (utr, amount, gmailEmail, appPassword, sinceTs = null) => {
+const verifyUTRWithCredentials = async (utr, amount, gmailEmail, appPassword, sinceTs = null, type = 'fampay') => {
   let connection = null;
   try {
     connection = await connectIMAP(gmailEmail, appPassword);
     await connection.openBox('INBOX');
 
-    // Same as PHP script — narrow to FamX subject
-    const searchCriteria = [['SUBJECT', 'FamX account']];
+    // Subject filter based on type
+    let searchCriteria;
+    if (type === 'fampay') {
+      searchCriteria = [['SUBJECT', 'You have successfully received']];
+    } else if (type === 'paytm') {
+      searchCriteria = [['SUBJECT', 'You have received a payment']];
+    } else {
+      searchCriteria = [['SUBJECT', 'You have successfully received']];
+    }
+
     const fetchOptions = {
       bodies: ['TEXT', 'HEADER'],
-      markSeen: false,
-      struct: true
+      markSeen: false
     };
 
     const messages = await connection.search(searchCriteria, fetchOptions);
     connection.end();
+    connection = null;
 
-    if (!messages || messages.length === 0) {
-      return null;
-    }
+    if (!messages || messages.length === 0) return null;
 
-    // Last 30 emails — newest first (same as PHP rsort)
+    // Last 30 emails — newest first
     const recent = messages.slice(-30).reverse();
 
     for (const msg of recent) {
-      // Get email timestamp
+      // Get timestamp
       const headerPart = msg.parts.find(p => p.which === 'HEADER');
       const emailDate = headerPart?.body?.date?.[0];
       const emailTs = emailDate ? Math.floor(new Date(emailDate).getTime() / 1000) : null;
 
-      // Reject old emails — same as PHP (90 sec buffer)
+      // Reject old emails (90 sec buffer)
       if (sinceTs && emailTs && emailTs < (sinceTs - 90)) continue;
 
       // Get body
@@ -70,42 +84,42 @@ const verifyUTRWithCredentials = async (utr, amount, gmailEmail, appPassword, si
 
       let body = textPart.body || '';
 
-      // Decode base64 if needed
+      // Try base64 decode
       try {
         const decoded = Buffer.from(body, 'base64').toString('utf8');
-        if (decoded.length > 0) body = decoded;
+        if (decoded.length > 10) body = decoded;
       } catch (e) {}
 
-      // Strip HTML tags
+      // Strip HTML
       body = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-      // Amount pattern — same as PHP: "received ₹X"
-      const amountMatch = body.match(/received\s+(?:₹|Rs\.?)\s*([\d,]+(?:\.\d+)?)/ui);
+      // Amount pattern — FamPay: "₹150.0"
+      const amountMatch = body.match(/(?:₹|Rs\.?)\s*([\d,]+(?:\.\d+)?)/ui);
       if (!amountMatch) continue;
 
       const emailAmount = parseFloat(amountMatch[1].replace(',', ''));
       if (Math.abs(emailAmount - parseFloat(amount)) > 0.009) continue;
 
-      // UTR pattern — same as PHP
+      // UTR pattern — FamPay: "UTR : 623851978381"
       let extractedUTR = null;
-      const utrMatch = body.match(/UTR[:\s]+(\d+)/i);
+      const utrMatch = body.match(/UTR\s*[:\s]+(\d{10,})/i);
       if (utrMatch) extractedUTR = utrMatch[1];
 
-      // Txn ID pattern — same as PHP
+      // Transaction ID — FamPay: "FMPIB6477798764"
       let txnId = null;
-      const txnMatch = body.match(/transaction\s+id\s+([A-Z0-9]+)/i);
+      const txnMatch = body.match(/(?:Transaction\s+ID|transaction\s+id)\s*[:\s]+([A-Z0-9]+)/i);
       if (txnMatch) txnId = txnMatch[1];
 
       const identifier = extractedUTR || txnId;
       if (!identifier) continue;
 
-      // Match UTR — same as PHP mode=utr
+      // Match UTR
       const typed = utr;
       const matches = (extractedUTR === typed) || (txnId === typed) || body.includes(typed);
       if (!matches) continue;
 
-      // Extract sender name — same as PHP
-      const senderMatch = body.match(/from\s+([A-Za-z][A-Za-z0-9\s]{1,40}?)\s+at\s+\d/ui);
+      // Extract sender name
+      const senderMatch = body.match(/from\s+([A-Za-z][A-Za-z0-9\s]{1,40}?)\s/ui);
       const sender = senderMatch ? senderMatch[1].trim() : 'Unknown';
 
       return {
@@ -135,7 +149,6 @@ const verifyPaytmPayment = async (mid, orderId, expectedAmount) => {
 
     return new Promise((resolve, reject) => {
       const url = `https://securegw.paytm.in/order/status?JsonData=${encodeURIComponent(JsonData)}`;
-      
       https.get(url, (res) => {
         let data = '';
         res.on('data', chunk => data += chunk);
