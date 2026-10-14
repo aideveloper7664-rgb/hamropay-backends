@@ -19,7 +19,9 @@ router.post('/create', authMiddleware, async (req, res) => {
       .select('id, upi_id, type')
       .eq('merchant_id', req.merchant.id)
       .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (!cashier) {
       return res.status(400).json({
@@ -131,7 +133,9 @@ router.post('/verify', authMiddleware, async (req, res) => {
       .select('*')
       .eq('merchant_id', req.merchant.id)
       .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     // Verify UTR
     let verified = null;
@@ -273,7 +277,7 @@ router.get('/status/:order_id', async (req, res) => {
   try {
     const { data: order, error } = await supabase
       .from('orders')
-      .select('*, merchants(name, api_key)')
+      .select('*, merchants(name)')
       .eq('order_id', req.params.order_id)
       .single();
 
@@ -287,15 +291,25 @@ router.get('/status/:order_id', async (req, res) => {
       .select('upi_id, type')
       .eq('merchant_id', order.merchant_id)
       .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!cashier) {
+      return res.status(409).json({ success: false, message: 'Merchant has no active payment account' });
+    }
 
     return res.json({
       success: true,
       data: {
-        ...order,
-        upi_id: cashier?.upi_id || '',
-        cashier_type: cashier?.type || '',
-        qr_code: cashier ? `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${order.amount}&cu=INR` : ''
+        order_id: order.order_id,
+        amount: order.amount,
+        status: order.status,
+        expires_at: order.expires_at,
+        merchant_name: order.merchants?.name || '',
+        upi_id: cashier.upi_id,
+        cashier_type: cashier.type,
+        qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${order.amount}&cu=INR`)}`
       }
     });
   } catch (err) {

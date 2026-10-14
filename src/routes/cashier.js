@@ -4,6 +4,17 @@ const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
 require('dotenv').config();
 
+// Does this merchant already have ANY active cashier (fampay or paytm)?
+async function merchantHasActiveCashier(merchantId) {
+  const { data } = await supabase
+    .from('cashier_accounts')
+    .select('id')
+    .eq('merchant_id', merchantId)
+    .eq('is_active', true)
+    .limit(1);
+  return !!(data && data.length > 0);
+}
+
 // Get all cashier accounts
 router.get('/list', authMiddleware, async (req, res) => {
   try {
@@ -40,6 +51,8 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Max 3 FamPay accounts allowed' });
     }
 
+    const hasActive = await merchantHasActiveCashier(req.merchant.id);
+
     // Encrypt app password
     const crypto = require('crypto');
     const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
@@ -59,7 +72,7 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
         phone,
         gmail_email,
         gmail_app_password: encryptedPass,
-        is_active: !existing || existing.length === 0,
+        is_active: !hasActive,
         is_verified: true
       }])
       .select('id, type, upi_id, phone, gmail_email, is_active, is_verified')
@@ -96,6 +109,8 @@ router.post('/paytm/add', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Max 3 Paytm accounts allowed' });
     }
 
+    const hasActive = await merchantHasActiveCashier(req.merchant.id);
+
     const { data, error } = await supabase
       .from('cashier_accounts')
       .insert([{
@@ -104,7 +119,7 @@ router.post('/paytm/add', authMiddleware, async (req, res) => {
         upi_id,
         phone,
         paytm_mid: paytm_mid || null,
-        is_active: !existing || existing.length === 0,
+        is_active: !hasActive,
         is_verified: true
       }])
       .select('id, type, upi_id, phone, is_active, is_verified')
@@ -125,13 +140,23 @@ router.post('/paytm/add', authMiddleware, async (req, res) => {
 // Toggle active account
 router.patch('/:id/toggle', authMiddleware, async (req, res) => {
   try {
-    const { type } = req.body;
+    // Account must belong to this merchant
+    const { data: target } = await supabase
+      .from('cashier_accounts')
+      .select('id')
+      .eq('id', req.params.id)
+      .eq('merchant_id', req.merchant.id)
+      .maybeSingle();
 
+    if (!target) {
+      return res.status(404).json({ success: false, message: 'Account not found' });
+    }
+
+    // Only ONE active cashier per merchant (across fampay + paytm)
     await supabase
       .from('cashier_accounts')
       .update({ is_active: false })
-      .eq('merchant_id', req.merchant.id)
-      .eq('type', type);
+      .eq('merchant_id', req.merchant.id);
 
     const { error } = await supabase
       .from('cashier_accounts')
@@ -170,13 +195,15 @@ router.get('/active', authMiddleware, async (req, res) => {
       .select('id, type, upi_id, phone, gmail_email')
       .eq('merchant_id', req.merchant.id)
       .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (error || !data) {
       return res.status(404).json({ success: false, message: 'No active cashier found' });
     }
 
-    return res.json({ success: true, data });
+    return res.json({ success: true, data, cashier: data });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }

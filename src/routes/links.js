@@ -19,7 +19,9 @@ router.post('/create', authMiddleware, async (req, res) => {
       .select('id, upi_id, type')
       .eq('merchant_id', req.merchant.id)
       .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (!cashier) {
       return res.status(400).json({
@@ -105,7 +107,7 @@ router.get('/:linkId', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('payment_links')
-      .select('*, merchants(name, id, api_key)')
+      .select('*, merchants(name, id)')
       .eq('link_id', req.params.linkId)
       .eq('status', 'active')
       .single();
@@ -120,15 +122,27 @@ router.get('/:linkId', async (req, res) => {
       .select('upi_id, type')
       .eq('merchant_id', data.merchants.id)
       .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
+    if (!cashier) {
+      return res.status(409).json({ success: false, message: 'Merchant has no active payment account' });
+    }
+
+    // Only safe, public fields (never spread the DB row: it can contain merchant data)
     return res.json({
       success: true,
       data: {
-        ...data,
-        upi_id: cashier?.upi_id || '',
-        cashier_type: cashier?.type || '',
-        qr_code: cashier ? `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${data.amount}&cu=INR` : ''
+        link_id: data.link_id,
+        title: data.title,
+        amount: data.amount,
+        note: data.note,
+        status: data.status,
+        merchant_name: data.merchants?.name || '',
+        upi_id: cashier.upi_id,
+        cashier_type: cashier.type,
+        qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${data.amount}&cu=INR`)}`
       }
     });
   } catch (err) {
@@ -155,7 +169,7 @@ router.delete('/:linkId', authMiddleware, async (req, res) => {
 // Verify payment for link
 router.post('/:linkId/verify', async (req, res) => {
   try {
-    const { utr, amount } = req.body;
+    const { utr } = req.body;
 
     if (!utr) {
       return res.status(400).json({ success: false, message: 'UTR required' });
@@ -189,11 +203,13 @@ router.post('/:linkId/verify', async (req, res) => {
       .select('*')
       .eq('merchant_id', link.merchants.id)
       .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     // Verify UTR
     let verified = null;
-    const payAmount = amount || link.amount;
+    const payAmount = link.amount; // never trust amount from the client
 
     if (cashier && cashier.type === 'fampay' && cashier.gmail_app_password) {
       const crypto = require('crypto');
