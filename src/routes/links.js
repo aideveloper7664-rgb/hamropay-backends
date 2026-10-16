@@ -7,10 +7,13 @@ const { authMiddleware } = require('../middleware/auth');
 // Create Payment Link
 router.post('/create', authMiddleware, async (req, res) => {
   try {
-    const { title, amount, note } = req.body;
+    const { title, amount, note, is_test } = req.body;
 
     if (!title || !amount) {
       return res.status(400).json({ success: false, message: 'Title and amount required' });
+    }
+    if (!(Number(amount) > 0)) {
+      return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
     }
 
     // Check if merchant has active cashier
@@ -55,6 +58,7 @@ router.post('/create', authMiddleware, async (req, res) => {
         amount,
         note,
         status: 'active',
+        is_test: is_test === true,
         total_collected: 0,
         total_orders: 0
       }])
@@ -109,11 +113,19 @@ router.get('/:linkId', async (req, res) => {
       .from('payment_links')
       .select('*, merchants(name, id)')
       .eq('link_id', req.params.linkId)
-      .eq('status', 'active')
       .single();
 
     if (error || !data) {
       return res.status(404).json({ success: false, message: 'Payment link not found' });
+    }
+
+    // Merchant disabled this link -> customer must not be able to pay
+    if (data.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        code: 'LINK_DISABLED',
+        message: 'This payment link is currently disabled by the merchant'
+      });
     }
 
     // Get merchant active cashier
@@ -139,10 +151,72 @@ router.get('/:linkId', async (req, res) => {
         amount: data.amount,
         note: data.note,
         status: data.status,
+        is_test: !!data.is_test,
         merchant_name: data.merchants?.name || '',
         upi_id: cashier.upi_id,
         cashier_type: cashier.type,
         qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${data.amount}&cu=INR`)}`
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Update link: enable/disable, test mode, edit details (merchant only)
+router.patch('/:linkId', authMiddleware, async (req, res) => {
+  try {
+    const { status, is_test, title, amount, note } = req.body;
+    const updates = {};
+
+    if (status !== undefined) {
+      if (!['active', 'inactive'].includes(status)) {
+        return res.status(400).json({ success: false, message: "status must be 'active' or 'inactive'" });
+      }
+      updates.status = status;
+    }
+    if (is_test !== undefined) {
+      if (typeof is_test !== 'boolean') {
+        return res.status(400).json({ success: false, message: 'is_test must be true or false' });
+      }
+      updates.is_test = is_test;
+    }
+    if (title !== undefined) {
+      if (!String(title).trim()) {
+        return res.status(400).json({ success: false, message: 'Title cannot be empty' });
+      }
+      updates.title = String(title).trim();
+    }
+    if (amount !== undefined) {
+      if (!(Number(amount) > 0)) {
+        return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
+      }
+      updates.amount = Number(amount);
+    }
+    if (note !== undefined) updates.note = note;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, message: 'Nothing to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('payment_links')
+      .update(updates)
+      .eq('link_id', req.params.linkId)
+      .eq('merchant_id', req.merchant.id)
+      .select()
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      return res.status(404).json({ success: false, message: 'Payment link not found' });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        ...data,
+        payment_url: `${process.env.FRONTEND_URL || 'https://hamro-pay-kilj.vercel.app'}/pay/${data.link_id}`
       }
     });
   } catch (err) {
@@ -179,11 +253,54 @@ router.post('/:linkId/verify', async (req, res) => {
       .from('payment_links')
       .select('*, merchants(*)')
       .eq('link_id', req.params.linkId)
-      .eq('status', 'active')
       .single();
 
     if (linkError || !link) {
-      return res.status(404).json({ success: false, message: 'Link not found or inactive' });
+      return res.status(404).json({ success: false, message: 'Payment link not found' });
+    }
+
+    if (link.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        code: 'LINK_DISABLED',
+        message: 'This payment link is currently disabled by the merchant'
+      });
+    }
+
+    // ---------- TEST MODE: no Gmail check, no wallet, no credits, no DB writes ----------
+    if (link.is_test) {
+      const TEST_UTR = '000000000000';
+      if (String(utr).trim() !== TEST_UTR) {
+        return res.status(400).json({
+          success: false,
+          test_mode: true,
+          message: `Test mode: enter UTR ${TEST_UTR} to simulate a successful payment`
+        });
+      }
+
+      const testOrderId = 'TEST_' + uuidv4().replace(/-/g, '').toUpperCase().slice(0, 12);
+
+      if (link.merchants?.webhook_url) {
+        fetch(link.merchants.webhook_url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            event: 'payment.test',
+            test: true,
+            order_id: testOrderId,
+            link_id: req.params.linkId,
+            utr: TEST_UTR,
+            amount: link.amount
+          })
+        }).catch(() => {});
+      }
+
+      return res.json({
+        success: true,
+        test_mode: true,
+        message: 'Test payment successful (no real money moved)',
+        data: { order_id: testOrderId, utr: TEST_UTR, amount: link.amount, net_amount: link.amount, commission: 0, test: true }
+      });
     }
 
     // Check UTR already used
