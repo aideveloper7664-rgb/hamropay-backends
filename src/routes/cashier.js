@@ -40,15 +40,43 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'All fields required' });
     }
 
-    // Check max 3 accounts
+    const cleanUpi = String(upi_id).trim();
+    const cleanEmail = String(gmail_email).trim().toLowerCase();
+    const cleanPass = String(gmail_app_password).replace(/\s/g, '');
+
+    if (!/^[A-Za-z0-9._-]{2,}@[A-Za-z0-9]{2,}$/.test(cleanUpi)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid UPI ID (like 9876543210@fam)' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid Gmail address' });
+    }
+    if (cleanPass.length < 8) {
+      return res.status(400).json({ success: false, message: 'Enter the 16-letter Google App Password' });
+    }
+
+    // Check max 3 accounts + duplicates
     const { data: existing } = await supabase
       .from('cashier_accounts')
-      .select('id')
+      .select('id, upi_id, gmail_email')
       .eq('merchant_id', req.merchant.id)
       .eq('type', 'fampay');
 
     if (existing && existing.length >= 3) {
       return res.status(400).json({ success: false, message: 'Max 3 FamPay accounts allowed' });
+    }
+    if (existing && existing.some((a) => a.upi_id === cleanUpi || String(a.gmail_email || '').toLowerCase() === cleanEmail)) {
+      return res.status(400).json({ success: false, message: 'This UPI ID or Gmail is already connected' });
+    }
+
+    // Gmail login asli me check karo: galat App Password wala account kabhi save na ho
+    const { verifyGmailLogin, friendlyError } = require('../services/history.service');
+    try {
+      await verifyGmailLogin(cleanEmail, cleanPass);
+    } catch (err) {
+      const e = friendlyError(err);
+      console.error('[fampay/add] gmail check failed:', e.code);
+      // 401 nahi bhejte: frontend use "logout" samajh sakta hai
+      return res.status(e.code === 'GMAIL_AUTH' ? 400 : e.status).json({ success: false, code: e.code, message: e.message });
     }
 
     const hasActive = await merchantHasActiveCashier(req.merchant.id);
@@ -58,7 +86,7 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
     const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-    let encrypted = cipher.update(gmail_app_password, 'utf8', 'hex');
+    let encrypted = cipher.update(cleanPass, 'utf8', 'hex');
     encrypted += cipher.final('hex');
     const encryptedPass = iv.toString('hex') + ':' + encrypted;
 
@@ -68,9 +96,9 @@ router.post('/fampay/add', authMiddleware, async (req, res) => {
       .insert([{
         merchant_id: req.merchant.id,
         type: 'fampay',
-        upi_id,
+        upi_id: cleanUpi,
         phone,
-        gmail_email,
+        gmail_email: cleanEmail,
         gmail_app_password: encryptedPass,
         is_active: !hasActive,
         is_verified: true

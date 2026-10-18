@@ -1,7 +1,7 @@
 const imapSimple = require('imap-simple');
 const { simpleParser } = require('mailparser');
 
-const FAMPAY_SUBJECT = 'You have successfully received';
+const FAMPAY_SUBJECT = 'received';   // subject me 'received' (FamPay: "You have successfully received ₹X"); asli FamPay mail ki jaanch neeche code me hoti hai
 const CACHE_TTL_MS = 10 * 1000; // Sync button spam se Gmail/Render ko bachane ke liye
 const HARD_TIMEOUT_MS = 25 * 1000;
 
@@ -16,21 +16,42 @@ function cleanText(mail) {
   return text.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
 }
 
-// FamPay email text se fields nikalna (best-effort: jo field na mile wo null)
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+// "11:17 AM IST, 17 October 2026" -> ISO (UTC). IST = UTC+5:30, server timezone se koi farak nahi padta.
+function parseIstTime(str) {
+  const m = String(str || '').match(/(\d{1,2}):(\d{2})\s*([AP]M)\s*IST,?\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/i);
+  if (!m) return null;
+  const month = MONTHS[m[5].slice(0, 3).toLowerCase()];
+  if (month === undefined) return null;
+  let hour = parseInt(m[1], 10) % 12;
+  if (m[3].toUpperCase() === 'PM') hour += 12;
+  const ms = Date.UTC(parseInt(m[6], 10), month, parseInt(m[4], 10), hour, parseInt(m[2], 10)) - (5.5 * 60 * 60 * 1000);
+  return isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
+// FamPay email text se fields nikalna. Patterns asli FamPay emails ke hisaab se:
+//   "... received ₹1 from <Naam> at 11:17 AM IST, 17 October 2026 ... transaction id <CODE> ... UTR: <digits>"
+// Jo field na mile wo null.
 function parseFamPayEmail(text, subject = '') {
   const hay = `${subject} ${text}`;
 
-  const amountMatch = hay.match(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i);
+  const amountMatch =
+    text.match(/received\s+(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i) ||
+    subject.match(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i) ||
+    hay.match(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i);
   if (!amountMatch) return null;
   const amount = toNumber(amountMatch[1]);
   if (!(amount > 0)) return null;
 
-  const utr = (text.match(/UTR\s*(?:No\.?|Number)?\s*[:\-]?\s*(\d{10,})/i) || [])[1] || null;
-  const txnId = (text.match(/Transaction\s*ID\s*[:\-]?\s*([A-Z0-9]{6,})/i) || [])[1] || null;
+  const utr = (text.match(/UTR\s*(?:No\.?|Number)?\s*[:\-]?\s*(\d{8,})/i) || [])[1] || null;
+  const txnId = (text.match(/transaction\s*id\s*[:\-]?\s*([A-Z0-9]{6,})/i) || [])[1] || null;
   const reference = utr || txnId;
 
   let sender = null;
-  const senderMatch = text.match(/\bfrom\s+([A-Za-z][A-Za-z0-9 .&'-]{1,40}?)(?=\s+(?:on|via|using|with|through|to|at|UPI|Rs|₹|UTR|Transaction)\b|[.,]|$)/i);
+  const senderMatch =
+    text.match(/\bfrom\s+([A-Za-z][A-Za-z0-9 .&'-]{1,60}?)\s+at\s+\d/i) ||
+    text.match(/\bfrom\s+([A-Za-z][A-Za-z0-9 .&'-]{1,40}?)(?=\s+(?:on|via|using|with|through|to|at|UPI|Rs|₹|UTR|Transaction)\b|[.,]|$)/i);
   if (senderMatch) {
     const cand = senderMatch[1].trim();
     if (!/^(your|the|a|an|fampay|upi|bank)\b/i.test(cand)) sender = cand;
@@ -42,7 +63,9 @@ function parseFamPayEmail(text, subject = '') {
   const balMatch = text.match(/Balance\s*(?:is|:|-)?\s*(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i);
   const balance = balMatch ? toNumber(balMatch[1]) : null;
 
-  return { amount, reference, alt_reference: reference === utr ? txnId : utr, sender, purpose, balance };
+  const txnTime = parseIstTime(text);
+
+  return { amount, reference, alt_reference: reference === utr ? txnId : utr, sender, purpose, balance, txn_time: txnTime };
 }
 
 async function connect(email, appPassword) {
@@ -93,6 +116,10 @@ async function loadHistory({ email, appPassword, days, limit, debug, before }) {
       const text = cleanText(mail);
       if (debug && !debugSample) debugSample = { subject: mail.subject || '', text: text.slice(0, 600) };
 
+      // Sirf FamPay ki mail: sender/subject/body me 'fam' + 'received' (doosri apps ki "payment received" mail na aaye)
+      const fromText = (mail.from && mail.from.text) || '';
+      if (!/fam/i.test(`${fromText} ${mail.subject || ''} ${text}`) || !/received/i.test(`${mail.subject || ''} ${text}`)) continue;
+
       const parsed = parseFamPayEmail(text, mail.subject || '');
       if (!parsed) continue;
 
@@ -107,7 +134,7 @@ async function loadHistory({ email, appPassword, days, limit, debug, before }) {
         amount: parsed.amount,
         sender: parsed.sender || 'NA',
         purpose: parsed.purpose || null,
-        date: mail.date ? new Date(mail.date).toISOString() : null,
+        date: parsed.txn_time || (mail.date ? new Date(mail.date).toISOString() : null),
         balance_after: parsed.balance
       });
     }
@@ -185,4 +212,26 @@ async function getFamPayHistory(cacheKey, opts) {
   return job;
 }
 
-module.exports = { getFamPayHistory, parseFamPayEmail, friendlyError };
+// Account add karte waqt: Gmail + App Password sach me chalta hai ya nahi (login + INBOX open)
+async function verifyGmailLogin(email, appPassword) {
+  let connection = null;
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => { const e = new Error('timeout'); e.code = 'GMAIL_TIMEOUT'; rej(e); }, 20 * 1000);
+  });
+  try {
+    await Promise.race([
+      (async () => {
+        connection = await connect(email, appPassword);
+        await connection.openBox('INBOX');
+      })(),
+      timeout
+    ]);
+    return true;
+  } finally {
+    clearTimeout(timer);
+    if (connection) { try { connection.end(); } catch {} }
+  }
+}
+
+module.exports = { getFamPayHistory, parseFamPayEmail, parseIstTime, verifyGmailLogin, friendlyError };
