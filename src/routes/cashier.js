@@ -210,6 +210,7 @@ router.get('/active', authMiddleware, async (req, res) => {
 });
 
 // Live email history of the ACTIVE FamPay account (reads the merchant's own Gmail)
+// ?days=30 (1-90 per window)  ?limit=200 (1-300)  ?before=<ISO date> (purani emails ke liye)  ?refresh=1
 router.get('/history', authMiddleware, async (req, res) => {
   try {
     const { data: cashier } = await supabase
@@ -237,15 +238,29 @@ router.get('/history', authMiddleware, async (req, res) => {
     appPassword += decipher.final('utf8');
 
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 90);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 300);
+
+    // before: sirf valid date, aaj se aage nahi, 2 saal se purani nahi
+    let before = null;
+    if (req.query.before) {
+      const d = new Date(String(req.query.before));
+      const now = Date.now();
+      if (isNaN(d.getTime())) {
+        return res.status(400).json({ success: false, message: 'Invalid before date' });
+      }
+      const oldest = now - 730 * 24 * 60 * 60 * 1000;
+      before = new Date(Math.min(Math.max(d.getTime(), oldest), now));
+      before.setUTCHours(0, 0, 0, 0);
+    }
 
     const { getFamPayHistory, friendlyError } = require('../services/history.service');
     try {
-      const data = await getFamPayHistory(`${req.merchant.id}:${cashier.id}`, {
+      const data = await getFamPayHistory(`${req.merchant.id}:${cashier.id}:${days}:${limit}:${before ? before.toISOString() : 'now'}`, {
         email: cashier.gmail_email,
         appPassword,
         days,
         limit,
+        before,
         debug: req.query.debug === '1',
         ttlMs: req.query.refresh === '1' ? 3000 : 10000
       });

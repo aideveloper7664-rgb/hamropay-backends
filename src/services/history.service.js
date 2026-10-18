@@ -60,20 +60,24 @@ async function connect(email, appPassword) {
   });
 }
 
-async function loadHistory({ email, appPassword, days, limit, debug }) {
+async function loadHistory({ email, appPassword, days, limit, debug, before }) {
   let connection = null;
   try {
     connection = await connect(email, appPassword);
     await connection.openBox('INBOX');
 
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const messages = await connection.search(
-      [['SUBJECT', FAMPAY_SUBJECT], ['SINCE', since]],
-      { bodies: [''], markSeen: false }
-    );
+    const DAY = 24 * 60 * 60 * 1000;
+    const windowEnd = before ? new Date(before) : null;                       // null = abhi tak
+    const since = new Date((windowEnd ? windowEnd.getTime() : Date.now()) - days * DAY);
+    const criteria = [['SUBJECT', FAMPAY_SUBJECT], ['SINCE', since]];
+    if (windowEnd) criteria.push(['BEFORE', windowEnd]);
+
+    const messages = await connection.search(criteria, { bodies: [''], markSeen: false });
     connection.end();
     connection = null;
 
+    const total = (messages || []).length;
+    const truncated = total > limit;                                          // is window me limit se zyada emails thi
     const recent = (messages || []).slice(-limit).reverse(); // newest first
     const transactions = [];
     const seen = new Set();
@@ -110,6 +114,13 @@ async function loadHistory({ email, appPassword, days, limit, debug }) {
 
     const latestBalance = transactions.find(t => t.balance_after !== null)?.balance_after ?? null;
 
+    // Agla (purana) window kahan se shuru ho. Truncated ho to usi din tak wapas aao (us din ki baaki emails na chhootein).
+    let nextBefore = since;
+    if (truncated) {
+      const dates = transactions.map(t => t.date).filter(Boolean).map(d => new Date(d).getTime());
+      if (dates.length) nextBefore = new Date(Math.min(...dates) + DAY);
+    }
+
     const result = {
       transactions: transactions.map(({ balance_after, ...t }) => t),
       stats: {
@@ -118,6 +129,12 @@ async function loadHistory({ email, appPassword, days, limit, debug }) {
         balance: latestBalance,            // null = email me balance nahi mila
         last_synced: new Date().toISOString(),
         window_days: days
+      },
+      window: {
+        from: since.toISOString(),
+        to: windowEnd ? windowEnd.toISOString() : null,
+        truncated,
+        next_before: nextBefore.toISOString()   // "Load older" isi ko ?before= me bhejo
       }
     };
     if (debug) result.debug_sample = debugSample;
