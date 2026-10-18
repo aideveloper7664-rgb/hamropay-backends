@@ -1,8 +1,144 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
+const { getFamPayHistory } = require('../services/history.service');
+
+const SESSION_MINUTES = 8;      // checkout kitni der valid rahega
+const MAX_PAISE_SLOTS = 50;     // ek hi waqt me max itne parallel checkouts (99.00 ... 99.49)
+const round2 = (n) => Math.round(Number(n) * 100) / 100;
+const frontendUrl = () => process.env.FRONTEND_URL || 'https://hamro-pay-kilj.vercel.app';
+
+// ---- helpers ----
+function decryptAppPassword(encrypted) {
+  const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
+  const [ivHex, data] = encrypted.split(':');
+  const decipher = crypto.createDecipheriv('aes-256-cbc', key, Buffer.from(ivHex, 'hex'));
+  let out = decipher.update(data, 'hex', 'utf8');
+  out += decipher.final('utf8');
+  return out;
+}
+
+async function getActiveCashier(merchantId) {
+  const { data } = await supabase
+    .from('cashier_accounts')
+    .select('*')
+    .eq('merchant_id', merchantId)
+    .eq('is_active', true)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return data || null;
+}
+
+// Naye checkout sessions ki spam rokne ke liye (per link, per minute)
+const sessionHits = new Map();
+function allowNewSession(linkId) {
+  const now = Date.now();
+  const arr = (sessionHits.get(linkId) || []).filter((t) => now - t < 60 * 1000);
+  if (arr.length >= 30) return false;
+  arr.push(now);
+  sessionHits.set(linkId, arr);
+  return true;
+}
+
+// Payment confirm hone ke baad sab kuch yahin hota hai (manual verify aur auto-detect dono use karte hain)
+async function settlePayment({ link, merchant, payAmount, utr, messageId }) {
+  const commissionPercent = merchant.commission || 2;
+  const commission = round2((payAmount * commissionPercent) / 100);
+  const netAmount = round2(payAmount - commission);
+
+  const { data: credit } = await supabase
+    .from('hamro_credits')
+    .select('balance, total_spent')
+    .eq('merchant_id', merchant.id)
+    .single();
+
+  if (!credit || credit.balance < commission) {
+    return { ok: false, status: 400, message: 'Insufficient Hamro Credits. Please purchase more credits.' };
+  }
+
+  const orderId = 'ORD_' + uuidv4().replace(/-/g, '').toUpperCase().slice(0, 16);
+
+  const { data: order } = await supabase
+    .from('orders')
+    .insert([{
+      merchant_id: merchant.id,
+      order_id: orderId,
+      amount: payAmount,
+      status: 'success',
+      utr,
+      expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString()
+    }])
+    .select()
+    .single();
+
+  const { error: txnError } = await supabase.from('transactions').insert([{
+    order_id: order.id,
+    merchant_id: merchant.id,
+    amount: payAmount,
+    commission,
+    net_amount: netAmount,
+    utr,
+    gmail_message_id: messageId || null
+  }]);
+
+  if (txnError) {
+    await supabase.from('orders').delete().eq('order_id', orderId);
+    return { ok: false, status: 400, message: 'UTR already used' };
+  }
+
+  const { data: wallet } = await supabase
+    .from('wallets')
+    .select('balance, total_earned')
+    .eq('merchant_id', merchant.id)
+    .single();
+
+  await supabase.from('wallets').update({
+    balance: round2((wallet.balance || 0) + netAmount),
+    total_earned: round2((wallet.total_earned || 0) + netAmount),
+    updated_at: new Date().toISOString()
+  }).eq('merchant_id', merchant.id);
+
+  await supabase.from('hamro_credits').update({
+    balance: round2(credit.balance - commission),
+    total_spent: round2((credit.total_spent || 0) + commission),
+    updated_at: new Date().toISOString()
+  }).eq('merchant_id', merchant.id);
+
+  await supabase.from('credit_transactions').insert([{
+    merchant_id: merchant.id,
+    type: 'deduct',
+    amount: commission,
+    order_id: orderId,
+    note: `Commission for link ${link.link_id}`
+  }]);
+
+  await supabase.from('payment_links').update({
+    total_collected: round2((link.total_collected || 0) + payAmount),
+    total_orders: (link.total_orders || 0) + 1
+  }).eq('link_id', link.link_id);
+
+  if (merchant.webhook_url) {
+    fetch(merchant.webhook_url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'payment.success',
+        order_id: orderId,
+        link_id: link.link_id,
+        utr,
+        amount: payAmount,
+        net_amount: netAmount,
+        commission
+      })
+    }).catch(() => {});
+  }
+
+  return { ok: true, data: { order_id: orderId, utr, amount: payAmount, net_amount: netAmount, commission } };
+}
 
 // Create Payment Link
 router.post('/create', authMiddleware, async (req, res) => {
@@ -240,13 +376,235 @@ router.delete('/:linkId', authMiddleware, async (req, res) => {
   }
 });
 
-// Verify payment for link
+// ======================= CHECKOUT SESSIONS (auto-detect) =======================
+
+// Customer pay page khulne par: is checkout ke liye unique amount reserve karo
+router.post('/:linkId/session', async (req, res) => {
+  try {
+    const { data: link } = await supabase
+      .from('payment_links')
+      .select('*')
+      .eq('link_id', req.params.linkId)
+      .maybeSingle();
+
+    if (!link) return res.status(404).json({ success: false, message: 'Payment link not found' });
+    if (link.status !== 'active') {
+      return res.status(403).json({ success: false, code: 'LINK_DISABLED', message: 'This payment link is currently disabled by the merchant' });
+    }
+    // Test links me auto-detect nahi hota (wahan sirf test UTR chalta hai)
+    if (link.is_test) return res.json({ success: true, test_mode: true, data: null });
+
+    const cashier = await getActiveCashier(link.merchant_id);
+    if (!cashier) {
+      return res.status(409).json({ success: false, message: 'Merchant has no active payment account' });
+    }
+
+    const toPayload = (sess) => ({
+      session_id: sess.session_id,
+      status: sess.status,
+      base_amount: Number(sess.base_amount),
+      pay_amount: Number(sess.pay_amount),
+      expires_at: sess.expires_at,
+      server_time: new Date().toISOString(),
+      upi_id: cashier.upi_id,
+      qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${Number(sess.pay_amount).toFixed(2)}&cu=INR`)}`
+    });
+
+    // Page refresh par purana checkout wapas lo (naya amount mat banao)
+    const resumeId = req.body && req.body.session_id;
+    if (resumeId) {
+      const { data: old } = await supabase
+        .from('checkout_sessions')
+        .select('*')
+        .eq('session_id', String(resumeId))
+        .eq('link_id', link.link_id)
+        .maybeSingle();
+      if (old && old.status === 'pending' && new Date(old.expires_at) > new Date()) {
+        return res.json({ success: true, data: toPayload(old) });
+      }
+    }
+
+    if (!allowNewSession(link.link_id)) {
+      return res.status(429).json({ success: false, message: 'Too many requests. Please wait a minute and try again.' });
+    }
+
+    // Expire ho chuke pending sessions ke amount free karo
+    await supabase
+      .from('checkout_sessions')
+      .update({ status: 'expired' })
+      .eq('merchant_id', link.merchant_id)
+      .eq('status', 'pending')
+      .lt('expires_at', new Date().toISOString());
+
+    let created = null;
+    for (let i = 0; i < MAX_PAISE_SLOTS; i++) {
+      const payAmount = round2(Number(link.amount) + i * 0.01);
+      const { data, error } = await supabase
+        .from('checkout_sessions')
+        .insert([{
+          session_id: 'cs_' + crypto.randomBytes(16).toString('hex'),
+          merchant_id: link.merchant_id,
+          link_id: link.link_id,
+          base_amount: link.amount,
+          pay_amount: payAmount,
+          status: 'pending',
+          expires_at: new Date(Date.now() + SESSION_MINUTES * 60 * 1000).toISOString()
+        }])
+        .select()
+        .single();
+
+      if (!error) { created = data; break; }
+      if (error.code !== '23505') throw error; // 23505 = ye amount abhi kisi aur checkout ke paas hai, agla try karo
+    }
+
+    if (!created) {
+      return res.status(429).json({ success: false, message: 'Too many checkouts in progress. Please try again in a few minutes.' });
+    }
+
+    return res.status(201).json({ success: true, data: toPayload(created) });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Page har 3 second me ye poochta hai. Backend Gmail check karke payment mile to khud confirm kar deta hai.
+router.get('/session/:sid/status', async (req, res) => {
+  try {
+    const { data: s } = await supabase
+      .from('checkout_sessions')
+      .select('*')
+      .eq('session_id', req.params.sid)
+      .maybeSingle();
+
+    if (!s) return res.status(404).json({ success: false, message: 'Checkout not found' });
+
+    const out = (status, extra = {}) => res.json({
+      success: true,
+      data: {
+        status,
+        pay_amount: Number(s.pay_amount),
+        expires_at: s.expires_at,
+        server_time: new Date().toISOString(),
+        utr: status === 'paid' ? s.utr : null,
+        order_id: status === 'paid' ? s.order_id : null,
+        ...extra
+      }
+    });
+
+    if (s.status !== 'pending') return out(s.status);
+
+    if (new Date(s.expires_at) <= new Date()) {
+      await supabase.from('checkout_sessions').update({ status: 'expired' }).eq('session_id', s.session_id).eq('status', 'pending');
+      return out('expired');
+    }
+
+    const { data: link } = await supabase
+      .from('payment_links')
+      .select('*, merchants(*)')
+      .eq('link_id', s.link_id)
+      .maybeSingle();
+
+    if (!link || link.status !== 'active') return out('disabled');
+
+    const cashier = await getActiveCashier(s.merchant_id);
+    if (!cashier || cashier.type !== 'fampay' || !cashier.gmail_app_password) {
+      return out('pending', { auto_detect: false }); // sirf manual UTR chalega
+    }
+
+    let scan;
+    try {
+      scan = await getFamPayHistory(`${s.merchant_id}:${cashier.id}:auto`, {
+        email: cashier.gmail_email,
+        appPassword: decryptAppPassword(cashier.gmail_app_password),
+        days: 2,
+        limit: 20,
+        ttlMs: 5000
+      });
+    } catch (e) {
+      console.error('[auto-detect] gmail error:', e && e.message);
+      return out('pending', { auto_detect: false, scan_error: true });
+    }
+
+    const minTs = new Date(s.created_at).getTime() - 2 * 60 * 1000;
+    const candidates = scan.transactions.filter((t) =>
+      t.reference &&
+      Math.abs(t.amount - Number(s.pay_amount)) < 0.005 &&
+      t.date && new Date(t.date).getTime() >= minTs
+    );
+
+    for (const t of candidates) {
+      const { data: used } = await supabase.from('transactions').select('id').eq('utr', t.reference).maybeSingle();
+      if (used) continue;
+
+      // Atomic claim: sirf ek hi request is session ko paid bana sakti hai
+      const { data: claimed } = await supabase
+        .from('checkout_sessions')
+        .update({ status: 'paid', utr: t.reference, paid_at: new Date().toISOString() })
+        .eq('session_id', s.session_id)
+        .eq('status', 'pending')
+        .select()
+        .maybeSingle();
+
+      if (!claimed) {
+        const { data: fresh } = await supabase.from('checkout_sessions').select('*').eq('session_id', s.session_id).maybeSingle();
+        s.status = fresh ? fresh.status : s.status; s.utr = fresh && fresh.utr; s.order_id = fresh && fresh.order_id;
+        return out(s.status);
+      }
+
+      const result = await settlePayment({
+        link,
+        merchant: link.merchants,
+        payAmount: Number(s.pay_amount),
+        utr: t.reference,
+        messageId: t.message_id
+      });
+
+      if (!result.ok) {
+        await supabase.from('checkout_sessions').update({ status: 'failed' }).eq('session_id', s.session_id);
+        return out('failed', { message: result.message, utr: t.reference });
+      }
+
+      await supabase.from('checkout_sessions').update({ order_id: result.data.order_id }).eq('session_id', s.session_id);
+      s.utr = t.reference; s.order_id = result.data.order_id;
+      return out('paid');
+    }
+
+    return out('pending', { auto_detect: true });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Customer "Cancel payment" dabaye to checkout band, amount free
+router.post('/session/:sid/cancel', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('checkout_sessions')
+      .update({ status: 'cancelled' })
+      .eq('session_id', req.params.sid)
+      .eq('status', 'pending')
+      .select()
+      .maybeSingle();
+
+    if (error) throw error;
+    // Pehle se paid/expired/cancelled ho to bhi theek hai (idempotent)
+    return res.json({ success: true, data: { cancelled: !!data } });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ======================= MANUAL VERIFY (UTR) =======================
 router.post('/:linkId/verify', async (req, res) => {
   try {
-    const { utr } = req.body;
+    const utr = String((req.body && req.body.utr) || '').trim();
+    const sessionId = req.body && req.body.session_id;
 
     if (!utr) {
       return res.status(400).json({ success: false, message: 'UTR required' });
+    }
+    if (!/^[A-Za-z0-9]{6,30}$/.test(utr)) {
+      return res.status(400).json({ success: false, message: 'Invalid UTR format' });
     }
 
     const { data: link, error: linkError } = await supabase
@@ -270,7 +628,7 @@ router.post('/:linkId/verify', async (req, res) => {
     // ---------- TEST MODE: no Gmail check, no wallet, no credits, no DB writes ----------
     if (link.is_test) {
       const TEST_UTR = '000000000000';
-      if (String(utr).trim() !== TEST_UTR) {
+      if (utr !== TEST_UTR) {
         return res.status(400).json({
           success: false,
           test_mode: true,
@@ -280,7 +638,7 @@ router.post('/:linkId/verify', async (req, res) => {
 
       const testOrderId = 'TEST_' + uuidv4().replace(/-/g, '').toUpperCase().slice(0, 12);
 
-      if (link.merchants?.webhook_url) {
+      if (link.merchants && link.merchants.webhook_url) {
         fetch(link.merchants.webhook_url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -303,156 +661,93 @@ router.post('/:linkId/verify', async (req, res) => {
       });
     }
 
+    // Checkout session ho to uska unique amount expect karo
+    let session = null;
+    if (sessionId) {
+      const { data: sess } = await supabase
+        .from('checkout_sessions')
+        .select('*')
+        .eq('session_id', String(sessionId))
+        .eq('link_id', link.link_id)
+        .maybeSingle();
+      session = sess || null;
+      if (session && session.status === 'paid') {
+        return res.status(400).json({ success: false, message: 'This checkout is already paid' });
+      }
+    }
+    const expectedAmount = session ? Number(session.pay_amount) : Number(link.amount);
+
     // Check UTR already used
     const { data: existingTxn } = await supabase
       .from('transactions')
       .select('id')
       .eq('utr', utr)
-      .single();
+      .maybeSingle();
 
     if (existingTxn) {
       return res.status(400).json({ success: false, message: 'UTR already used' });
     }
 
-    // Get merchant cashier
-    const { data: cashier } = await supabase
-      .from('cashier_accounts')
-      .select('*')
-      .eq('merchant_id', link.merchants.id)
-      .eq('is_active', true)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const cashier = await getActiveCashier(link.merchants.id);
 
-    // Verify UTR
     let verified = null;
-    const payAmount = link.amount; // never trust amount from the client
 
     if (cashier && cashier.type === 'fampay' && cashier.gmail_app_password) {
-      const crypto = require('crypto');
-      const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
-      const [ivHex, encrypted] = cashier.gmail_app_password.split(':');
-      const iv = Buffer.from(ivHex, 'hex');
-      const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
+      // Exact match only: typed UTR/Txn ID email ke UTR ya Transaction ID se bilkul same hona chahiye
+      let scan;
+      try {
+        scan = await getFamPayHistory(`${link.merchants.id}:${cashier.id}:manual`, {
+          email: cashier.gmail_email,
+          appPassword: decryptAppPassword(cashier.gmail_app_password),
+          days: 7,
+          limit: 50,
+          ttlMs: 3000
+        });
+      } catch (e) {
+        console.error('[verify] gmail error:', e && e.message);
+        return res.status(502).json({ success: false, message: 'Could not read payment emails right now. Please try again in a moment.' });
+      }
 
-      const gmailService = require('../services/gmail.service');
-      verified = await gmailService.verifyUTRWithCredentials(
-        utr, payAmount, cashier.gmail_email, decrypted
+      const hit = scan.transactions.find((t) =>
+        (t.reference === utr || t.alt_reference === utr) &&
+        Math.abs(t.amount - expectedAmount) < 0.005
       );
+      if (hit) verified = { messageId: hit.message_id };
     } else {
+      // Non-FamPay cashier: purana tarika
       const gmailService = require('../services/gmail.service');
-      verified = await gmailService.verifyUTR(utr, payAmount);
+      verified = await gmailService.verifyUTR(utr, expectedAmount);
     }
 
     if (!verified) {
-      return res.status(400).json({ success: false, message: 'Payment not found. Check UTR and try again.' });
-    }
-
-    const merchant = link.merchants;
-    const commissionPercent = merchant.commission || 2;
-    const commission = (payAmount * commissionPercent) / 100;
-    const netAmount = payAmount - commission;
-
-    // Check Hamro Credit
-    const { data: credit } = await supabase
-      .from('hamro_credits')
-      .select('balance, total_spent')
-      .eq('merchant_id', merchant.id)
-      .single();
-
-    if (!credit || credit.balance < commission) {
       return res.status(400).json({
         success: false,
-        message: 'Insufficient Hamro Credits. Please purchase more credits.'
+        message: session
+          ? `Payment of ₹${expectedAmount.toFixed(2)} not found. Check UTR and make sure you paid the exact amount.`
+          : 'Payment not found. Check UTR and try again.'
       });
     }
 
-    // Create order record
-    const orderId = 'ORD_' + uuidv4().replace(/-/g, '').toUpperCase().slice(0, 16);
-
-    const { data: order } = await supabase
-      .from('orders')
-      .insert([{
-        merchant_id: merchant.id,
-        order_id: orderId,
-        amount: payAmount,
-        status: 'success',
-        utr,
-        expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString()
-      }])
-      .select()
-      .single();
-
-    // Save transaction
-    await supabase.from('transactions').insert([{
-      order_id: order.id,
-      merchant_id: merchant.id,
-      amount: payAmount,
-      commission,
-      net_amount: netAmount,
+    const result = await settlePayment({
+      link,
+      merchant: link.merchants,
+      payAmount: expectedAmount,
       utr,
-      gmail_message_id: verified.messageId
-    }]);
+      messageId: verified.messageId
+    });
 
-    // Credit Hamro Cash (wallet)
-    const { data: wallet } = await supabase
-      .from('wallets')
-      .select('balance, total_earned')
-      .eq('merchant_id', merchant.id)
-      .single();
-
-    await supabase.from('wallets').update({
-      balance: (wallet.balance || 0) + netAmount,
-      total_earned: (wallet.total_earned || 0) + netAmount,
-      updated_at: new Date().toISOString()
-    }).eq('merchant_id', merchant.id);
-
-    // Deduct Hamro Credit
-    await supabase.from('hamro_credits').update({
-      balance: credit.balance - commission,
-      total_spent: (credit.total_spent || 0) + commission,
-      updated_at: new Date().toISOString()
-    }).eq('merchant_id', merchant.id);
-
-    // Save credit transaction
-    await supabase.from('credit_transactions').insert([{
-      merchant_id: merchant.id,
-      type: 'deduct',
-      amount: commission,
-      order_id: orderId,
-      note: `Commission for link ${req.params.linkId}`
-    }]);
-
-    // Update link stats
-    await supabase.from('payment_links').update({
-      total_collected: (link.total_collected || 0) + payAmount,
-      total_orders: (link.total_orders || 0) + 1
-    }).eq('link_id', req.params.linkId);
-
-    // Fire webhook
-    if (merchant.webhook_url) {
-      fetch(merchant.webhook_url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'payment.success',
-          order_id: orderId,
-          link_id: req.params.linkId,
-          utr,
-          amount: payAmount,
-          net_amount: netAmount,
-          commission
-        })
-      }).catch(() => {});
+    if (!result.ok) {
+      return res.status(result.status).json({ success: false, message: result.message });
     }
 
-    return res.json({
-      success: true,
-      message: 'Payment verified!',
-      data: { order_id: orderId, utr, amount: payAmount, net_amount: netAmount, commission }
-    });
+    if (session) {
+      await supabase
+        .from('checkout_sessions')
+        .update({ status: 'paid', utr, order_id: result.data.order_id, paid_at: new Date().toISOString() })
+        .eq('session_id', session.session_id);
+    }
+
+    return res.json({ success: true, message: 'Payment verified!', data: result.data });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }

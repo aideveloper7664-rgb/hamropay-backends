@@ -209,4 +209,55 @@ router.get('/active', authMiddleware, async (req, res) => {
   }
 });
 
+// Live email history of the ACTIVE FamPay account (reads the merchant's own Gmail)
+router.get('/history', authMiddleware, async (req, res) => {
+  try {
+    const { data: cashier } = await supabase
+      .from('cashier_accounts')
+      .select('id, type, gmail_email, gmail_app_password')
+      .eq('merchant_id', req.merchant.id)
+      .eq('is_active', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!cashier) {
+      return res.status(404).json({ success: false, code: 'NO_CASHIER', message: 'No active cashier found' });
+    }
+    if (cashier.type !== 'fampay' || !cashier.gmail_app_password || !cashier.gmail_email) {
+      return res.status(400).json({ success: false, code: 'NOT_FAMPAY', message: 'Email history is available for FamPay accounts only' });
+    }
+
+    // Decrypt app password
+    const crypto = require('crypto');
+    const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
+    const [ivHex, encrypted] = cashier.gmail_app_password.split(':');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, Buffer.from(ivHex, 'hex'));
+    let appPassword = decipher.update(encrypted, 'hex', 'utf8');
+    appPassword += decipher.final('utf8');
+
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 90);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+
+    const { getFamPayHistory, friendlyError } = require('../services/history.service');
+    try {
+      const data = await getFamPayHistory(`${req.merchant.id}:${cashier.id}`, {
+        email: cashier.gmail_email,
+        appPassword,
+        days,
+        limit,
+        debug: req.query.debug === '1',
+        ttlMs: req.query.refresh === '1' ? 3000 : 10000
+      });
+      return res.json({ success: true, data });
+    } catch (err) {
+      const e = friendlyError(err);
+      console.error('[cashier/history]', e.code, err?.message);
+      return res.status(e.status).json({ success: false, code: e.code, message: e.message });
+    }
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;
