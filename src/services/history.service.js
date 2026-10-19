@@ -134,7 +134,8 @@ async function loadHistory({ email, appPassword, days, limit, debug, before }) {
         amount: parsed.amount,
         sender: parsed.sender || 'NA',
         purpose: parsed.purpose || null,
-        date: parsed.txn_time || (mail.date ? new Date(mail.date).toISOString() : null),
+        date: parsed.txn_time || (mail.date ? new Date(mail.date).toISOString() : null),   // dikhane ke liye (email body ka time)
+        mail_date: mail.date ? new Date(mail.date).toISOString() : null,                    // matching ke liye (email header, UTC)
         balance_after: parsed.balance
       });
     }
