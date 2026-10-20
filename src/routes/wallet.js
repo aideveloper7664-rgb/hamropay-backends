@@ -178,6 +178,7 @@ router.get('/payments', authMiddleware, async (req, res) => {
 
     let sq = supabase.from('checkout_sessions').select('*')
       .eq('merchant_id', req.merchant.id)
+      .eq('is_test', false)            // test-mode orders history me nahi dikhte
       .order('created_at', { ascending: false })
       .limit(limit + 1);
     let tq = supabase.from('transactions').select('*')
@@ -196,7 +197,7 @@ router.get('/payments', authMiddleware, async (req, res) => {
     const txns = tRes.data || [];
 
     // Link titles
-    const linkIds = [...new Set(sessions.map((x) => x.link_id))];
+    const linkIds = [...new Set(sessions.map((x) => x.link_id).filter(Boolean))];
     const titles = {};
     if (linkIds.length) {
       const { data: links } = await supabase
@@ -230,7 +231,7 @@ router.get('/payments', authMiddleware, async (req, res) => {
         id: x.id,
         order_id: x.order_id || x.session_id,
         link_id: x.link_id,
-        link_title: titles[x.link_id] || null,
+        link_title: titles[x.link_id] || x.title || null,
         amount: Number(x.pay_amount),
         net_amount: t ? Number(t.net_amount) : null,
         commission: t ? Number(t.commission) : null,
