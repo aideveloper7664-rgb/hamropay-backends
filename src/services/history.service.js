@@ -68,6 +68,63 @@ function parseFamPayEmail(text, subject = '') {
   return { amount, reference, alt_reference: reference === utr ? txnId : utr, sender, purpose, balance, txn_time: txnTime };
 }
 
+
+// Paytm email text se fields nikalna. Paytm ka asli email format abhi dekha nahi hai, isliye parser dheela (tolerant) hai:
+// ek payment tabhi maani jaati hai jab amount + 10+ digit UTR / UPI Ref / RRN dono mile (cashback/promo mails se bachne ke liye).
+function parsePaytmEmail(text, subject = '') {
+  const hay = `${subject} ${text}`;
+  if (!/(received|credited|paid\s+you|payment\s+of)/i.test(hay)) return null;
+
+  const amountMatch =
+    text.match(/(?:received|credited|paid)\s+(?:of\s+|with\s+)?(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i) ||
+    subject.match(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i) ||
+    hay.match(/(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i);
+  if (!amountMatch) return null;
+  const amount = toNumber(amountMatch[1]);
+  if (!(amount > 0)) return null;
+
+  const utr = (text.match(/(?:UTR|UPI\s*Ref(?:erence)?(?:\s*(?:No\.?|Number|ID))?|RRN|Ref(?:erence)?\s*(?:No\.?|Number|ID))\s*[:\-#]?\s*(\d{10,})/i) || [])[1] || null;
+  if (!utr) return null;   // bina asli reference ke koi payment nahi
+  const txnId = (text.match(/(?:Transaction|Txn|Order)\s*ID\s*[:\-#]?\s*([A-Za-z0-9]{8,})/i) || [])[1] || null;
+
+  let sender = null;
+  const senderMatch = text.match(/\b(?:from|by)\s+([A-Za-z][A-Za-z0-9 .&'-]{1,40}?)(?=\s+(?:on|via|using|with|through|to|at|UPI|Rs|₹|UTR|Ref|Transaction|Txn)\b|[.,]|$)/i);
+  if (senderMatch) {
+    const cand = senderMatch[1].trim();
+    if (!/^(your|the|a|an|paytm|upi|bank|account)\b/i.test(cand)) sender = cand;
+  }
+
+  // "3:35 PM, 18 Oct 2026" / "18 October 2026, 3:35 PM" jaisi time (IST maani jaati hai). Na mile to email header date use hota hai.
+  let txnTime = null;
+  const tm = text.match(/(\d{1,2}):(\d{2})\s*([AP]M)/i);
+  const dm = text.match(/(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})/);
+  if (tm && dm) txnTime = parseIstTime(`${tm[1]}:${tm[2]} ${tm[3]} IST, ${dm[1]} ${dm[2]} ${dm[3]}`);
+
+  const balMatch = text.match(/Balance\s*(?:is|:|-)?\s*(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i);
+  const balance = balMatch ? toNumber(balMatch[1]) : null;
+
+  return { amount, reference: utr, alt_reference: txnId, sender, purpose: null, balance, txn_time: txnTime };
+}
+
+// Mail kis app ki hai? ('paytm' | 'fampay' | null)
+function detectProvider(fromText, subject, text) {
+  if (/paytm/i.test(fromText)) return 'paytm';
+  if (/fam/i.test(`${fromText} ${subject} ${text}`)) return 'fampay';
+  if (/paytm/i.test(subject)) return 'paytm';
+  return null;
+}
+
+// IMAP search: FamPay = subject "received"; Paytm = sender paytm; provider na ho to dono
+function buildCriteria(provider, since, windowEnd) {
+  let base;
+  if (provider === 'fampay') base = [['SUBJECT', FAMPAY_SUBJECT]];
+  else if (provider === 'paytm') base = [['OR', ['FROM', 'paytm'], ['SUBJECT', 'received']]];
+  else base = [['OR', ['SUBJECT', FAMPAY_SUBJECT], ['FROM', 'paytm']]];
+  const c = [...base, ['SINCE', since]];
+  if (windowEnd) c.push(['BEFORE', windowEnd]);
+  return c;
+}
+
 async function connect(email, appPassword) {
   return imapSimple.connect({
     imap: {
@@ -83,7 +140,7 @@ async function connect(email, appPassword) {
   });
 }
 
-async function loadHistory({ email, appPassword, days, limit, debug, before }) {
+async function loadHistory({ email, appPassword, days, limit, debug, before, provider }) {
   let connection = null;
   try {
     connection = await connect(email, appPassword);
@@ -92,8 +149,7 @@ async function loadHistory({ email, appPassword, days, limit, debug, before }) {
     const DAY = 24 * 60 * 60 * 1000;
     const windowEnd = before ? new Date(before) : null;                       // null = abhi tak
     const since = new Date((windowEnd ? windowEnd.getTime() : Date.now()) - days * DAY);
-    const criteria = [['SUBJECT', FAMPAY_SUBJECT], ['SINCE', since]];
-    if (windowEnd) criteria.push(['BEFORE', windowEnd]);
+    const criteria = buildCriteria(provider, since, windowEnd);
 
     const messages = await connection.search(criteria, { bodies: [''], markSeen: false });
     connection.end();
@@ -116,11 +172,18 @@ async function loadHistory({ email, appPassword, days, limit, debug, before }) {
       const text = cleanText(mail);
       if (debug && !debugSample) debugSample = { subject: mail.subject || '', text: text.slice(0, 600) };
 
-      // Sirf FamPay ki mail: sender/subject/body me 'fam' + 'received' (doosri apps ki "payment received" mail na aaye)
+      // Sirf us app ki mail jo is cashier ki hai (FamPay ya Paytm). Doosri apps ki "payment received" mail na aaye.
       const fromText = (mail.from && mail.from.text) || '';
-      if (!/fam/i.test(`${fromText} ${mail.subject || ''} ${text}`) || !/received/i.test(`${mail.subject || ''} ${text}`)) continue;
+      const kind = detectProvider(fromText, mail.subject || '', text);
+      if (!kind || (provider && provider !== kind)) continue;
 
-      const parsed = parseFamPayEmail(text, mail.subject || '');
+      let parsed;
+      if (kind === 'paytm') {
+        parsed = parsePaytmEmail(text, mail.subject || '');
+      } else {
+        if (!/received/i.test(`${mail.subject || ''} ${text}`)) continue;
+        parsed = parseFamPayEmail(text, mail.subject || '');
+      }
       if (!parsed) continue;
 
       const key = parsed.reference || `${parsed.amount}-${mail.date}`;
@@ -235,4 +298,4 @@ async function verifyGmailLogin(email, appPassword) {
   }
 }
 
-module.exports = { getFamPayHistory, parseFamPayEmail, parseIstTime, verifyGmailLogin, friendlyError };
+module.exports = { getFamPayHistory, parseFamPayEmail, parsePaytmEmail, parseIstTime, verifyGmailLogin, friendlyError };
