@@ -33,8 +33,10 @@ async function getActiveCashier(merchantId) {
 // Payment-link payment: link diya hota hai. Developer API order: link = null, orderCode = 'HP...'
 async function settlePayment({ link = null, merchant, payAmount, utr, messageId, orderCode = null }) {
   const commissionPercent = merchant.commission || 2;
+  // Paisa seedha merchant ke apne UPI me aata hai (Hamro Cash / wallet nahi). Isliye merchant ko poora payAmount milta hai.
+  // Commission alag se Hamro Credits se kati jaati hai.
   const commission = round2((payAmount * commissionPercent) / 100);
-  const netAmount = round2(payAmount - commission);
+  const netAmount = round2(payAmount);
 
   const { data: credit } = await supabase
     .from('hamro_credits')
@@ -75,18 +77,6 @@ async function settlePayment({ link = null, merchant, payAmount, utr, messageId,
     await supabase.from('orders').delete().eq('order_id', orderId);
     return { ok: false, status: 400, message: 'UTR already used' };
   }
-
-  const { data: wallet } = await supabase
-    .from('wallets')
-    .select('balance, total_earned')
-    .eq('merchant_id', merchant.id)
-    .single();
-
-  await supabase.from('wallets').update({
-    balance: round2((wallet.balance || 0) + netAmount),
-    total_earned: round2((wallet.total_earned || 0) + netAmount),
-    updated_at: new Date().toISOString()
-  }).eq('merchant_id', merchant.id);
 
   await supabase.from('hamro_credits').update({
     balance: round2(credit.balance - commission),
@@ -162,8 +152,8 @@ async function evaluateSession(s) {
   if (!merchant) return done('pending', { auto_detect: false });
 
   const cashier = await getActiveCashier(s.merchant_id);
-  if (!cashier || cashier.type !== 'fampay' || !cashier.gmail_app_password) {
-    return done('pending', { auto_detect: false }); // sirf manual UTR chalega
+  if (!cashier || !['fampay', 'paytm'].includes(cashier.type) || !cashier.gmail_app_password) {
+    return done('pending', { auto_detect: false }); // Gmail se detect nahi ho sakta (account Gmail ke saath connect nahi)
   }
 
   let scan;
@@ -173,7 +163,8 @@ async function evaluateSession(s) {
       appPassword: decryptAppPassword(cashier.gmail_app_password),
       days: 2,
       limit: 20,
-      ttlMs: 5000
+      ttlMs: 5000,
+      provider: cashier.type
     });
   } catch (e) {
     console.error('[auto-detect] gmail error:', e && e.message);
