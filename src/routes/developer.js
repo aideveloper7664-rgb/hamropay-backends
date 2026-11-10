@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
+const { resolveBranding } = require('../services/themes');
 const { MAX_PAISE_SLOTS, round2, getActiveCashier, evaluateSession } = require('../services/checkout.service');
 
 const ORDER_MINUTES = 15;                                         // developer order kitni der valid rahe
@@ -145,14 +146,6 @@ router.post('/create-order', devAuth, async (req, res) => {
         return res.status(400).json({ success: false, message: 'Insufficient Hamro Credits. Please purchase more credits.' });
       }
 
-      // Wallet limit (plan ke hisaab se): sirf Live mode me
-      const { data: wallet } = await supabase.from('wallets').select('balance').eq('merchant_id', m.id).maybeSingle();
-      const { data: mp } = await supabase.from('merchant_plans').select('*, plans(*)').eq('merchant_id', m.id).maybeSingle();
-      const walletLimit = mp && mp.plans && Number(mp.plans.wallet_limit);
-      if (walletLimit > 0 && (Number(wallet && wallet.balance) || 0) + amount > walletLimit) {
-        return res.status(400).json({ success: false, message: 'Your Hamro wallet is full. Upgrade your plan or withdraw first.' });
-      }
-
       // Expire ho chuke pending orders ke amount free karo
       await supabase.from('checkout_sessions').update({ status: 'expired' })
         .eq('merchant_id', m.id).eq('status', 'pending').lt('expires_at', new Date().toISOString());
@@ -248,7 +241,7 @@ router.get('/public-order/:orderId', async (req, res) => {
     let status = s.status;
     if (status === 'pending' && new Date(s.expires_at) <= new Date()) status = 'expired';
 
-    const { data: merchant } = await supabase.from('merchants').select('name').eq('id', s.merchant_id).maybeSingle();
+    const { data: merchant } = await supabase.from('merchants').select('*').eq('id', s.merchant_id).maybeSingle();
 
     const data = {
       order_id: s.session_id,
@@ -257,6 +250,7 @@ router.get('/public-order/:orderId', async (req, res) => {
       pay_amount: Number(s.pay_amount),
       status,
       merchant_name: (merchant && merchant.name) || '',
+      branding: resolveBranding(merchant),
       is_test: !!s.is_test,
       embedded: !!s.embedded,
       expires_at: s.expires_at,
