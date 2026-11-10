@@ -68,4 +68,111 @@ const THEMES = [
   { id: 'lavender', name: 'Lavender', group: 'Light', mode: 'light', base: '#f5f3ff',
     bg: '#f5f3ff', surface: '#ffffff', surface2: '#ede9fe', border: '#d6ccfa',
     text: '#1e1146', muted: '#5f4f94', accent: '#7c3aed', accent2: '#5b21b6', onAccent: '#ffffff' },
-  { id: 'sky', name: 'Sky', group: 'Light', mode:
+  { id: 'sky', name: 'Sky', group: 'Light', mode: 'light', base: '#f0f9ff',
+    bg: '#f0f9ff', surface: '#ffffff', surface2: '#e0f2fe', border: '#bae0f7',
+    text: '#082f49', muted: '#476a85', accent: '#0284c7', accent2: '#075985', onAccent: '#ffffff' }
+];
+
+const SHAPES = {
+  sharp: { id: 'sharp', name: 'Sharp', card: '6px', inner: '4px', button: '6px' },
+  round: { id: 'round', name: 'Rounded', card: '20px', inner: '12px', button: '12px' },
+  pill:  { id: 'pill',  name: 'Pill',  card: '30px', inner: '18px', button: '999px' }
+};
+
+const FONTS = {
+  modern:  { id: 'modern',  name: 'Modern',  stack: "Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" },
+  classic: { id: 'classic', name: 'Classic', stack: "Georgia, 'Times New Roman', serif" },
+  mono:    { id: 'mono',    name: 'Mono',    stack: "ui-monospace, 'SF Mono', Menlo, Consolas, monospace" },
+  rounded: { id: 'rounded', name: 'Rounded', stack: "ui-rounded, 'Nunito', 'Varela Round', system-ui, sans-serif" }
+};
+
+const DEFAULTS = { theme: 'default', color: null, brand_name: null, logo_url: null, footer: null, shape: 'round', font: 'modern' };
+const HEX = /^#[0-9a-fA-F]{6}$/;
+
+// ---------- color helpers ----------
+const toRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+const toHex = (rgb) => '#' + rgb.map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
+const mix = (a, b, t) => { const x = toRgb(a), y = toRgb(b); return toHex(x.map((v, i) => v + (y[i] - v) * t)); };
+const rgba = (hex, a) => { const [r, g, b] = toRgb(hex); return `rgba(${r}, ${g}, ${b}, ${a})`; };
+function luminance(hex) {
+  const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  const [r, g, b] = toRgb(hex);
+  return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+}
+function contrast(a, b) {
+  const l1 = luminance(a), l2 = luminance(b);
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+}
+
+const THEME_BY_ID = Object.fromEntries(THEMES.map((t) => [t.id, t]));
+const isValidTheme = (id) => Object.prototype.hasOwnProperty.call(THEME_BY_ID, id);
+
+// Merchant row (kuch columns na ho to bhi chalega) -> pay page ke liye taiyaar branding.
+// `vars` ko seedha style={{...vars}} me laga do. Isme koi secret nahi hota.
+function resolveBranding(m) {
+  m = m || {};
+  const theme = THEME_BY_ID[m.checkout_theme] || THEME_BY_ID[DEFAULTS.theme];
+  const shape = SHAPES[m.checkout_shape] || SHAPES[DEFAULTS.shape];
+  const font = FONTS[m.checkout_font] || FONTS[DEFAULTS.font];
+
+  let accent = theme.accent, accent2 = theme.accent2, onAccent = theme.onAccent;
+  const custom = m.checkout_color && HEX.test(m.checkout_color) ? m.checkout_color.toLowerCase() : null;
+  if (custom) {
+    accent = custom;
+    accent2 = mix(custom, '#000000', 0.28);
+    onAccent = contrast(custom, '#ffffff') >= contrast(custom, '#0a0a0a') ? '#ffffff' : '#0a0a0a';
+  }
+  const sem = theme.mode === 'light' ? LIGHT_SEMANTIC : DARK_SEMANTIC;
+
+  return {
+    theme_id: theme.id,
+    theme_name: theme.name,
+    mode: theme.mode,
+    custom_color: custom,
+    brand_name: m.checkout_brand_name || m.name || '',
+    logo_url: m.checkout_logo_url || null,
+    footer: m.checkout_footer || null,
+    shape: shape.id,
+    font: font.id,
+    powered_by: 'Hamro Pay',
+    vars: {
+      '--hp-bg': theme.bg,
+      '--hp-bg-base': theme.base,
+      '--hp-surface': theme.surface,
+      '--hp-surface-2': theme.surface2,
+      '--hp-border': theme.border,
+      '--hp-text': theme.text,
+      '--hp-muted': theme.muted,
+      '--hp-accent': accent,
+      '--hp-accent-2': accent2,
+      '--hp-on-accent': onAccent,
+      '--hp-grad': `linear-gradient(135deg, ${accent}, ${accent2})`,
+      '--hp-glow': rgba(accent, 0.35),
+      '--hp-accent-soft': rgba(accent, 0.14),
+      '--hp-ok': sem.ok,
+      '--hp-warn': sem.warn,
+      '--hp-bad': sem.bad,
+      '--hp-radius': shape.card,
+      '--hp-radius-sm': shape.inner,
+      '--hp-radius-btn': shape.button,
+      '--hp-font': font.stack
+    }
+  };
+}
+
+// Catalog (customize page ki gallery): har theme ka preview rang + group
+function catalog() {
+  return {
+    themes: THEMES.map((t) => ({
+      id: t.id, name: t.name, group: t.group, mode: t.mode,
+      preview: { bg: t.bg, base: t.base, surface: t.surface, text: t.text, accent: t.accent, accent2: t.accent2, on_accent: t.onAccent }
+    })),
+    shapes: Object.values(SHAPES).map(({ id, name }) => ({ id, name })),
+    fonts: Object.values(FONTS).map(({ id, name, stack }) => ({ id, name, stack })),
+    accent_presets: ['#ff2d55', '#f97316', '#fbbf24', '#84cc16', '#10b981', '#14b8a6', '#06b6d4', '#3b82f6', '#6366f1', '#8b5cf6', '#d946ef', '#ec4899', '#ef4444', '#64748b'],
+    limits: { brand_name: 40, logo_url: 500, footer: 120 },
+    defaults: DEFAULTS
+  };
+}
+
+module.exports = { THEMES, SHAPES, FONTS, DEFAULTS, HEX, isValidTheme, resolveBranding, catalog, contrast, luminance, mix };
