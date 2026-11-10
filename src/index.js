@@ -20,6 +20,7 @@ app.use('/api/credits', require('./routes/credits'));
 app.use('/api/referral', require('./routes/referral'));
 app.use('/api/plans', require('./routes/plans'));
 app.use('/api/promo', require('./routes/promo'));
+app.use('/api/customize', require('./routes/customize'));
 
 // Developer documentation + checkout widget (static files, src/static/)
 const STATIC_DIR = path.join(__dirname, 'static');
