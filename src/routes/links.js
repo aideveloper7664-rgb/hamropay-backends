@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
+const { resolveBranding } = require('../services/themes');
 const {
   SESSION_MINUTES, MAX_PAISE_SLOTS, round2,
   decryptAppPassword, getActiveCashier, settlePayment, evaluateSession, getFamPayHistory
@@ -127,7 +128,7 @@ router.get('/:linkId', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('payment_links')
-      .select('*, merchants(name, id)')
+      .select('*, merchants(*)')
       .eq('link_id', req.params.linkId)
       .single();
 
@@ -169,6 +170,7 @@ router.get('/:linkId', async (req, res) => {
         status: data.status,
         is_test: !!data.is_test,
         merchant_name: data.merchants?.name || '',
+        branding: resolveBranding(data.merchants),
         upi_id: cashier.upi_id,
         cashier_type: cashier.type,
         qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${data.amount}&cu=INR`)}`
@@ -554,5 +556,3 @@ router.post('/:linkId/verify', async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
-
-module.exports = router;
