@@ -34,8 +34,8 @@ router.get('/list', authMiddleware, async (req, res) => {
 // FamPay account: UPI ID + phone + Gmail + App Password.
 // Payment Gmail ki emails se detect hoti hai, isliye account add karte waqt Gmail login asli me check hota hai.
 function addEmailCashier(type) {
-  const label = 'FamPay';
-  const example = '9876543210@fam';
+  const label = { amazon: 'Amazon Pay', paytm: 'Paytm' }[type] || 'FamPay';
+  const example = { amazon: 'yourname@yapl', paytm: '9876543210@paytm' }[type] || '9876543210@fam';
 
   return async (req, res) => {
     try {
@@ -127,9 +127,84 @@ function addEmailCashier(type) {
 // Add FamPay account
 router.post('/fampay/add', authMiddleware, addEmailCashier('fampay'));
 
-// Paytm abhi supported nahi hai (payment auto-detect nahi ho sakta). Isliye account jodna band: koi merchant atke nahi.
-router.post('/paytm/add', authMiddleware, (req, res) => {
-  return res.status(400).json({ success: false, code: 'PAYTM_COMING_SOON', message: 'Paytm is coming soon. Please connect a FamPay account for now.' });
+// Add Amazon Pay account (wallet top-up email se detect hota hai; same Gmail + App Password flow)
+router.post('/amazon/add', authMiddleware, addEmailCashier('amazon'));
+
+// Add Paytm account (Gmail email se detect hota hai; same Gmail + App Password flow)
+// NOTE: Paytm ka parser abhi tak asli Paytm email se test nahi hua (tolerant parser) - pehle real email se check karo.
+router.post('/paytm/add', authMiddleware, addEmailCashier('paytm'));
+
+// Add Paytm account via MID + Merchant Key (official Paytm status API; Gmail ki zarurat nahi)
+// Customer ke UPI link me tr=<checkout session id> jaata hai, wahi Paytm ORDERID banta hai.
+router.post('/paytm-mid/add', authMiddleware, async (req, res) => {
+  try {
+    const { upi_id, phone, paytm_mid, paytm_merchant_key } = req.body || {};
+    if (!upi_id || !phone || !paytm_mid || !paytm_merchant_key) {
+      return res.status(400).json({ success: false, message: 'All fields required' });
+    }
+
+    const cleanUpi = String(upi_id).trim();
+    const cleanPhone = String(phone).trim();
+    const cleanMid = String(paytm_mid).trim();
+    const cleanKey = String(paytm_merchant_key).trim();
+
+    if (!/^[A-Za-z0-9._-]{2,}@[A-Za-z0-9]{2,}$/.test(cleanUpi)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid UPI ID (like 9876543210@paytm)' });
+    }
+    if (!/^[6-9]\d{9}$/.test(cleanPhone)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid 10-digit mobile number' });
+    }
+    if (!/^[A-Za-z0-9]{6,30}$/.test(cleanMid)) {
+      return res.status(400).json({ success: false, message: 'Merchant ID looks invalid. Check it in your Paytm Business dashboard.' });
+    }
+    if (cleanKey.length !== 16) {
+      return res.status(400).json({ success: false, message: 'Paytm Merchant Key must be exactly 16 characters.' });
+    }
+
+    const { data: existing } = await supabase
+      .from('cashier_accounts')
+      .select('id, upi_id, paytm_mid')
+      .eq('merchant_id', req.merchant.id)
+      .eq('type', 'paytm_mid');
+
+    if (existing && existing.length >= 3) {
+      return res.status(400).json({ success: false, message: 'Max 3 Paytm accounts allowed' });
+    }
+    if (existing && existing.some((a) => a.upi_id === cleanUpi || a.paytm_mid === cleanMid)) {
+      return res.status(400).json({ success: false, message: 'This UPI ID or Merchant ID is already connected' });
+    }
+
+    // MID + Key asli me Paytm se check karo: galat credentials wala account kabhi save na ho
+    const paytmService = require('../services/paytm.service');
+    const check = await paytmService.checkCredentials(cleanMid, cleanKey);
+    if (!check.ok) {
+      console.error('[paytm-mid/add] credential check failed:', check.reason);
+      return res.status(400).json({ success: false, code: 'PAYTM_' + check.reason, message: check.message });
+    }
+
+    const { encryptSecret } = require('../services/checkout.service');
+    const hasActive = await merchantHasActiveCashier(req.merchant.id);
+
+    const { data, error } = await supabase
+      .from('cashier_accounts')
+      .insert([{
+        merchant_id: req.merchant.id,
+        type: 'paytm_mid',
+        upi_id: cleanUpi,
+        phone: cleanPhone,
+        paytm_mid: cleanMid,
+        paytm_merchant_key: encryptSecret(cleanKey),
+        is_active: !hasActive,
+        is_verified: true
+      }])
+      .select('id, type, upi_id, phone, is_active, is_verified')
+      .single();
+
+    if (error) throw error;
+    return res.json({ success: true, data, message: 'Paytm account connected successfully' });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 // Toggle active account
@@ -220,8 +295,8 @@ router.get('/history', authMiddleware, async (req, res) => {
     if (!cashier) {
       return res.status(404).json({ success: false, code: 'NO_CASHIER', message: 'No active cashier found' });
     }
-    if (cashier.type !== 'fampay') {
-      return res.status(400).json({ success: false, code: 'NOT_SUPPORTED', message: 'Email history is available for FamPay accounts only' });
+    if (!['fampay', 'amazon', 'paytm'].includes(cashier.type)) {
+      return res.status(400).json({ success: false, code: 'NOT_SUPPORTED', message: 'Email history is available for FamPay, Amazon Pay and Paytm accounts only' });
     }
     if (!cashier.gmail_app_password || !cashier.gmail_email) {
       return res.status(400).json({ success: false, code: 'NO_GMAIL', message: 'This account has no Gmail connected. Remove it and connect it again with a Gmail App Password.' });
@@ -260,6 +335,7 @@ router.get('/history', authMiddleware, async (req, res) => {
         limit,
         before,
         debug: req.query.debug === '1',
+        provider: cashier.type,
         ttlMs: req.query.refresh === '1' ? 3000 : 10000
       });
       return res.json({ success: true, data });

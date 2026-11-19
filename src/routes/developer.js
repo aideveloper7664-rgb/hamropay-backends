@@ -5,7 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
 const { resolveBranding } = require('../services/themes');
-const { MAX_PAISE_SLOTS, round2, getActiveCashier, evaluateSession } = require('../services/checkout.service');
+const { MAX_PAISE_SLOTS, round2, buildUpiUri, getActiveCashier, evaluateSession } = require('../services/checkout.service');
 
 const ORDER_MINUTES = 15;                                         // developer order kitni der valid rahe
 const MIN_AMOUNT = 1;
@@ -263,7 +263,8 @@ router.get('/public-order/:orderId', async (req, res) => {
       const cashier = await getActiveCashier(s.merchant_id);
       if (!cashier) return res.status(409).json({ success: false, message: 'Merchant has no active payment account' });
       data.upi_id = cashier.upi_id;
-      data.qr_code = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${Number(s.pay_amount).toFixed(2)}&cu=INR`)}`;
+      data.upi_uri = buildUpiUri(cashier, s.pay_amount, s.session_id);
+      data.qr_code = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(data.upi_uri)}`;
     }
 
     return res.json({ success: true, data });

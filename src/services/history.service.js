@@ -106,20 +106,40 @@ function parsePaytmEmail(text, subject = '') {
   return { amount, reference: utr, alt_reference: txnId, sender, purpose: null, balance, txn_time: txnTime };
 }
 
-// Mail kis app ki hai? ('paytm' | 'fampay' | null)
+// Amazon Pay Wallet top-up email: "You have added ₹1.00 successfully to your Amazon Pay Wallet"
+// Amount = "added" wali line (wallet balance nahi). UPI Reference ID = unique txn id.
+// Body me transaction time nahi hota, isliye time email header se liya jaata hai (mail_date).
+function parseAmazonPayEmail(text, subject = '') {
+  const amountMatch = text.match(/You\s+have\s+added\s+(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i);
+  if (!amountMatch) return null;
+  const amount = toNumber(amountMatch[1]);
+  if (!(amount > 0)) return null;
+
+  const utr = (text.match(/UPI\s*Reference\s*ID\s*[:\-]?\s*(\d{8,})/i) || [])[1] || null;
+  if (!utr) return null;   // bina UPI Reference ID ke koi payment nahi
+
+  const balMatch = text.match(/Updated\s+Amazon\s+Pay\s+Balance\s*(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)/i);
+  const balance = balMatch ? toNumber(balMatch[1]) : null;
+
+  return { amount, reference: utr, alt_reference: null, sender: null, purpose: null, balance, txn_time: null };
+}
+
+// Mail kis app ki hai? ('paytm' | 'amazon' | 'fampay' | null)
 function detectProvider(fromText, subject, text) {
   if (/paytm/i.test(fromText)) return 'paytm';
+  if (/amazon/i.test(fromText) || /amazon pay/i.test(`${subject} ${text}`)) return 'amazon';
   if (/fam/i.test(`${fromText} ${subject} ${text}`)) return 'fampay';
   if (/paytm/i.test(subject)) return 'paytm';
   return null;
 }
 
-// IMAP search: FamPay = subject "received"; Paytm = sender paytm; provider na ho to dono
+// IMAP search: FamPay = subject "received"; Paytm = sender paytm; Amazon = sender amazon; provider na ho to sab
 function buildCriteria(provider, since, windowEnd) {
   let base;
   if (provider === 'fampay') base = [['SUBJECT', FAMPAY_SUBJECT]];
   else if (provider === 'paytm') base = [['OR', ['FROM', 'paytm'], ['SUBJECT', 'received']]];
-  else base = [['OR', ['SUBJECT', FAMPAY_SUBJECT], ['FROM', 'paytm']]];
+  else if (provider === 'amazon') base = [['OR', ['FROM', 'amazon'], ['SUBJECT', 'Amazon Pay']]];
+  else base = [['OR', ['OR', ['SUBJECT', FAMPAY_SUBJECT], ['FROM', 'paytm']], ['OR', ['FROM', 'amazon'], ['SUBJECT', 'Amazon Pay']]]];
   const c = [...base, ['SINCE', since]];
   if (windowEnd) c.push(['BEFORE', windowEnd]);
   return c;
@@ -180,6 +200,8 @@ async function loadHistory({ email, appPassword, days, limit, debug, before, pro
       let parsed;
       if (kind === 'paytm') {
         parsed = parsePaytmEmail(text, mail.subject || '');
+      } else if (kind === 'amazon') {
+        parsed = parseAmazonPayEmail(text, mail.subject || '');
       } else {
         if (!/received/i.test(`${mail.subject || ''} ${text}`)) continue;
         parsed = parseFamPayEmail(text, mail.subject || '');
@@ -298,4 +320,4 @@ async function verifyGmailLogin(email, appPassword) {
   }
 }
 
-module.exports = { getFamPayHistory, parseFamPayEmail, parsePaytmEmail, parseIstTime, verifyGmailLogin, friendlyError };
+module.exports = { getFamPayHistory, parseFamPayEmail, parsePaytmEmail, parseAmazonPayEmail, parseIstTime, verifyGmailLogin, friendlyError };

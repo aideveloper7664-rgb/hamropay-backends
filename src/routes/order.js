@@ -140,7 +140,34 @@ router.post('/verify', authMiddleware, async (req, res) => {
     // Verify UTR
     let verified = null;
 
-    if (cashier && cashier.type === 'fampay' && cashier.gmail_app_password) {
+    if (cashier && cashier.type === 'paytm_mid') {
+      return res.status(400).json({ success: false, message: 'Paytm MID payments are verified automatically from the checkout page.' });
+    }
+
+    if (cashier && ['amazon', 'paytm'].includes(cashier.type) && cashier.gmail_app_password) {
+      // Amazon Pay / Paytm: history service (provider filter ke saath) se exact UTR + amount match
+      const { getFamPayHistory } = require('../services/history.service');
+      const { decryptAppPassword } = require('../services/checkout.service');
+      let scan;
+      try {
+        scan = await getFamPayHistory(`${cashier.merchant_id}:${cashier.id}:order`, {
+          email: cashier.gmail_email,
+          appPassword: decryptAppPassword(cashier.gmail_app_password),
+          days: 7,
+          limit: 50,
+          ttlMs: 3000,
+          provider: cashier.type
+        });
+      } catch (e) {
+        console.error('[order/verify] amazon gmail error:', e && e.message);
+        return res.status(502).json({ success: false, message: 'Could not read payment emails right now. Please try again in a moment.' });
+      }
+      const hit = scan.transactions.find((t) =>
+        (t.reference === utr || t.alt_reference === utr) &&
+        Math.abs(t.amount - Number(order.amount)) < 0.005
+      );
+      verified = hit ? { messageId: hit.message_id } : null;
+    } else if (cashier && cashier.type === 'fampay' && cashier.gmail_app_password) {
       // Decrypt app password
       const crypto = require('crypto');
       const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);

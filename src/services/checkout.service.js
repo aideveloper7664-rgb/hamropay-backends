@@ -2,6 +2,10 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const { getFamPayHistory } = require('./history.service');
+const paytmService = require('./paytm.service');
+
+// Gmail (IMAP) se payment detect karne wale providers. Naya provider = yahan add karo + history.service me parser.
+const GMAIL_PROVIDERS = ['fampay', 'paytm', 'amazon'];
 
 const SESSION_MINUTES = 8;      // payment-link checkout kitni der valid rahe
 const MAX_PAISE_SLOTS = 50;     // ek merchant ke max itne parallel pending checkouts (x.00 ... x.49)
@@ -15,6 +19,23 @@ function decryptAppPassword(encrypted) {
   let out = decipher.update(data, 'hex', 'utf8');
   out += decipher.final('utf8');
   return out;
+}
+
+// App password / Paytm merchant key jaise secrets DB me encrypted rakhne ke liye (decryptAppPassword se wapas)
+function encryptSecret(plain) {
+  const key = process.env.ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32);
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  let enc = cipher.update(String(plain), 'utf8', 'hex');
+  enc += cipher.final('hex');
+  return iv.toString('hex') + ':' + enc;
+}
+
+// Customer ko dikhane wala UPI link. Paytm MID account me tr=<session_id> jaata hai (wahi Paytm ORDERID banta hai).
+function buildUpiUri(cashier, amount, sessionId) {
+  let uri = `upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${Number(amount).toFixed(2)}&cu=INR`;
+  if (cashier.type === 'paytm_mid' && sessionId) uri += `&tr=${encodeURIComponent(sessionId)}`;
+  return uri;
 }
 
 async function getActiveCashier(merchantId) {
@@ -118,6 +139,62 @@ async function settlePayment({ link = null, merchant, payAmount, utr, messageId,
   return { ok: true, data: { order_id: orderId, utr, amount: payAmount, net_amount: netAmount, commission } };
 }
 
+// Paid mila: session ko atomic claim karo, phir settle (commission, order, webhook). Gmail aur Paytm MID dono yahin aate hain.
+async function claimAndSettle({ s, link, merchant, reference, messageId }) {
+  const { data: claimed } = await supabase
+    .from('checkout_sessions')
+    .update({ status: 'paid', utr: reference, paid_at: new Date().toISOString() })
+    .eq('session_id', s.session_id)
+    .eq('status', 'pending')
+    .select()
+    .maybeSingle();
+
+  if (!claimed) {
+    const { data: fresh } = await supabase.from('checkout_sessions').select('*').eq('session_id', s.session_id).maybeSingle();
+    return fresh
+      ? { status: fresh.status, utr: fresh.utr || null, order_id: fresh.order_id || null, extra: {} }
+      : { status: s.status, utr: s.utr || null, order_id: s.order_id || null, extra: {} };
+  }
+
+  const result = await settlePayment({
+    link,
+    merchant,
+    payAmount: Number(s.pay_amount),
+    utr: reference,
+    messageId: messageId || null,
+    orderCode: s.link_id ? null : s.session_id   // developer order: order_id wahi rahe (HP...)
+  });
+
+  if (!result.ok) {
+    await supabase.from('checkout_sessions').update({ status: 'failed' }).eq('session_id', s.session_id);
+    await supabase.from('checkout_sessions').update({ fail_reason: result.message }).eq('session_id', s.session_id); // column na ho to chup-chaap skip
+    return { status: 'failed', utr: reference, order_id: null, extra: { message: result.message } };
+  }
+
+  await supabase.from('checkout_sessions').update({ order_id: result.data.order_id }).eq('session_id', s.session_id);
+  return { status: 'paid', utr: reference, order_id: result.data.order_id, extra: {} };
+}
+
+// Paytm MID account: session_id = Paytm ORDERID. Paytm ke official status API se TXN_SUCCESS + amount match.
+async function evaluatePaytmMid(s, cashier, link, merchant, done) {
+  if (!cashier.paytm_mid || !cashier.paytm_merchant_key) return done('pending', { auto_detect: false });
+
+  let r;
+  try {
+    r = await paytmService.getOrderStatus(cashier.paytm_mid, decryptAppPassword(cashier.paytm_merchant_key), s.session_id);
+  } catch (e) {
+    console.error('[auto-detect] paytm error:', e && e.message);
+    return done('pending', { auto_detect: false, scan_error: true });
+  }
+  if (!paytmService.isPaid(r, s.session_id, Number(s.pay_amount))) return done('pending', { auto_detect: true });
+
+  const reference = r.bankTxnId || r.txnId;
+  const { data: used } = await supabase.from('transactions').select('id').eq('utr', reference).maybeSingle();
+  if (used) return done('pending', { auto_detect: true });   // ye UTR pehle hi kisi order me use ho chuka
+
+  return claimAndSettle({ s, link, merchant, reference, messageId: null });
+}
+
 // Ek checkout session (payment-link ya developer order) ko check karo:
 // expiry, link disabled, Gmail me payment mili ya nahi. Mile to atomic claim + settle.
 // Return: { status, utr, order_id, extra }   status: pending | paid | expired | cancelled | disabled | failed
@@ -152,7 +229,10 @@ async function evaluateSession(s) {
   if (!merchant) return done('pending', { auto_detect: false });
 
   const cashier = await getActiveCashier(s.merchant_id);
-  if (!cashier || !['fampay', 'paytm'].includes(cashier.type) || !cashier.gmail_app_password) {
+  if (cashier && cashier.type === 'paytm_mid') {
+    return evaluatePaytmMid(s, cashier, link, merchant, done);
+  }
+  if (!cashier || !GMAIL_PROVIDERS.includes(cashier.type) || !cashier.gmail_app_password) {
     return done('pending', { auto_detect: false }); // Gmail se detect nahi ho sakta (account Gmail ke saath connect nahi)
   }
 
@@ -181,45 +261,14 @@ async function evaluateSession(s) {
   for (const t of candidates) {
     const { data: used } = await supabase.from('transactions').select('id').eq('utr', t.reference).maybeSingle();
     if (used) continue;
-
-    // Atomic claim: sirf ek hi request is session ko paid bana sakti hai
-    const { data: claimed } = await supabase
-      .from('checkout_sessions')
-      .update({ status: 'paid', utr: t.reference, paid_at: new Date().toISOString() })
-      .eq('session_id', s.session_id)
-      .eq('status', 'pending')
-      .select()
-      .maybeSingle();
-
-    if (!claimed) {
-      const { data: fresh } = await supabase.from('checkout_sessions').select('*').eq('session_id', s.session_id).maybeSingle();
-      return fresh ? { status: fresh.status, utr: fresh.utr || null, order_id: fresh.order_id || null, extra: {} } : done(s.status);
-    }
-
-    const result = await settlePayment({
-      link,
-      merchant,
-      payAmount: Number(s.pay_amount),
-      utr: t.reference,
-      messageId: t.message_id,
-      orderCode: s.link_id ? null : s.session_id   // developer order: order_id wahi rahe (HP...)
-    });
-
-    if (!result.ok) {
-      await supabase.from('checkout_sessions').update({ status: 'failed' }).eq('session_id', s.session_id);
-      await supabase.from('checkout_sessions').update({ fail_reason: result.message }).eq('session_id', s.session_id); // column na ho to chup-chaap skip
-      return { status: 'failed', utr: t.reference, order_id: null, extra: { message: result.message } };
-    }
-
-    await supabase.from('checkout_sessions').update({ order_id: result.data.order_id }).eq('session_id', s.session_id);
-    return { status: 'paid', utr: t.reference, order_id: result.data.order_id, extra: {} };
+    return claimAndSettle({ s, link, merchant, reference: t.reference, messageId: t.message_id });
   }
 
   return done('pending', { auto_detect: true });
 }
 
 module.exports = {
-  SESSION_MINUTES, MAX_PAISE_SLOTS, round2,
-  decryptAppPassword, getActiveCashier, settlePayment, evaluateSession,
+  GMAIL_PROVIDERS, SESSION_MINUTES, MAX_PAISE_SLOTS, round2,
+  decryptAppPassword, encryptSecret, buildUpiUri, getActiveCashier, settlePayment, evaluateSession,
   getFamPayHistory
 };

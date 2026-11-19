@@ -7,8 +7,9 @@ const { authMiddleware } = require('../middleware/auth');
 const { resolveBranding } = require('../services/themes');
 const {
   SESSION_MINUTES, MAX_PAISE_SLOTS, round2,
-  decryptAppPassword, getActiveCashier, settlePayment, evaluateSession, getFamPayHistory
+  decryptAppPassword, buildUpiUri, getActiveCashier, settlePayment, evaluateSession, getFamPayHistory
 } = require('../services/checkout.service');
+const paytmService = require('../services/paytm.service');
 
 // Naye checkout sessions ki spam rokne ke liye (per link, per minute)
 const sessionHits = new Map();
@@ -289,7 +290,8 @@ router.post('/:linkId/session', async (req, res) => {
       expires_at: sess.expires_at,
       server_time: new Date().toISOString(),
       upi_id: cashier.upi_id,
-      qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${Number(sess.pay_amount).toFixed(2)}&cu=INR`)}`
+      upi_uri: buildUpiUri(cashier, sess.pay_amount, sess.session_id),
+      qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(buildUpiUri(cashier, sess.pay_amount, sess.session_id))}`
     });
 
     // Page refresh par purana checkout wapas lo (naya amount mat banao)
@@ -496,7 +498,22 @@ router.post('/:linkId/verify', async (req, res) => {
 
     let verified = null;
 
-    if (cashier && cashier.type === 'fampay' && cashier.gmail_app_password) {
+    if (cashier && cashier.type === 'paytm_mid') {
+      // Paytm MID: session_id hi Paytm ORDERID hai. Typed UTR Paytm ke bank txn id ya txn id se bilkul same hona chahiye.
+      if (!session) {
+        return res.status(400).json({ success: false, message: 'Please reopen the checkout page and pay using the QR shown there.' });
+      }
+      let r;
+      try {
+        r = await paytmService.getOrderStatus(cashier.paytm_mid, decryptAppPassword(cashier.paytm_merchant_key), session.session_id);
+      } catch (e) {
+        console.error('[verify] paytm error:', e && e.message);
+        return res.status(502).json({ success: false, message: 'Could not reach Paytm right now. Please try again in a moment.' });
+      }
+      if (paytmService.isPaid(r, session.session_id, expectedAmount) && [r.bankTxnId, r.txnId].includes(utr)) {
+        verified = { messageId: null };
+      }
+    } else if (cashier && ['fampay', 'amazon', 'paytm'].includes(cashier.type) && cashier.gmail_app_password) {
       // Exact match only: typed UTR/Txn ID email ke UTR ya Transaction ID se bilkul same hona chahiye
       let scan;
       try {
@@ -505,7 +522,8 @@ router.post('/:linkId/verify', async (req, res) => {
           appPassword: decryptAppPassword(cashier.gmail_app_password),
           days: 7,
           limit: 50,
-          ttlMs: 3000
+          ttlMs: 3000,
+          provider: cashier.type
         });
       } catch (e) {
         console.error('[verify] gmail error:', e && e.message);
