@@ -5,7 +5,7 @@ const { getFamPayHistory } = require('./history.service');
 const paytmService = require('./paytm.service');
 
 // Gmail (IMAP) se payment detect karne wale providers. Naya provider = yahan add karo + history.service me parser.
-const GMAIL_PROVIDERS = ['fampay', 'paytm', 'amazon'];
+const GMAIL_PROVIDERS = ['fampay', 'amazon'];   // Paytm Gmail se nahi, sirf MID (type 'paytm_mid')
 
 const SESSION_MINUTES = 8;      // payment-link checkout kitni der valid rahe
 const MAX_PAISE_SLOTS = 50;     // ek merchant ke max itne parallel pending checkouts (x.00 ... x.49)

@@ -130,13 +130,23 @@ router.post('/fampay/add', authMiddleware, addEmailCashier('fampay'));
 // Add Amazon Pay account (wallet top-up email se detect hota hai; same Gmail + App Password flow)
 router.post('/amazon/add', authMiddleware, addEmailCashier('amazon'));
 
-// Add Paytm account (Gmail email se detect hota hai; same Gmail + App Password flow)
-// NOTE: Paytm ka parser abhi tak asli Paytm email se test nahi hua (tolerant parser) - pehle real email se check karo.
-router.post('/paytm/add', authMiddleware, addEmailCashier('paytm'));
+// Paytm sirf MID + Merchant Key se connect hota hai (Gmail se nahi).
+// /paytm/add purana naam hai: ab ye bhi MID flow par chalta hai, Gmail fields par saaf error deta hai.
+router.post('/paytm/add', authMiddleware, (req, res, next) => {
+  const b = req.body || {};
+  if (!b.paytm_mid || !b.paytm_merchant_key) {
+    return res.status(400).json({
+      success: false,
+      code: 'PAYTM_MID_ONLY',
+      message: 'Paytm connects only with Merchant ID (MID) and Merchant Key. Gmail is not supported for Paytm.'
+    });
+  }
+  return addPaytmMid(req, res, next);
+});
 
 // Add Paytm account via MID + Merchant Key (official Paytm status API; Gmail ki zarurat nahi)
 // Customer ke UPI link me tr=<checkout session id> jaata hai, wahi Paytm ORDERID banta hai.
-router.post('/paytm-mid/add', authMiddleware, async (req, res) => {
+const addPaytmMid = async (req, res) => {
   try {
     const { upi_id, phone, paytm_mid, paytm_merchant_key } = req.body || {};
     if (!upi_id || !phone || !paytm_mid || !paytm_merchant_key) {
@@ -205,7 +215,8 @@ router.post('/paytm-mid/add', authMiddleware, async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
-});
+};
+router.post('/paytm-mid/add', authMiddleware, addPaytmMid);
 
 // Toggle active account
 router.patch('/:id/toggle', authMiddleware, async (req, res) => {
@@ -295,8 +306,8 @@ router.get('/history', authMiddleware, async (req, res) => {
     if (!cashier) {
       return res.status(404).json({ success: false, code: 'NO_CASHIER', message: 'No active cashier found' });
     }
-    if (!['fampay', 'amazon', 'paytm'].includes(cashier.type)) {
-      return res.status(400).json({ success: false, code: 'NOT_SUPPORTED', message: 'Email history is available for FamPay, Amazon Pay and Paytm accounts only' });
+    if (!['fampay', 'amazon'].includes(cashier.type)) {
+      return res.status(400).json({ success: false, code: 'NOT_SUPPORTED', message: 'Email history is available for FamPay and Amazon Pay accounts only' });
     }
     if (!cashier.gmail_app_password || !cashier.gmail_email) {
       return res.status(400).json({ success: false, code: 'NO_GMAIL', message: 'This account has no Gmail connected. Remove it and connect it again with a Gmail App Password.' });

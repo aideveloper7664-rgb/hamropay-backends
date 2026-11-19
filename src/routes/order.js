@@ -144,8 +144,8 @@ router.post('/verify', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Paytm MID payments are verified automatically from the checkout page.' });
     }
 
-    if (cashier && ['amazon', 'paytm'].includes(cashier.type) && cashier.gmail_app_password) {
-      // Amazon Pay / Paytm: history service (provider filter ke saath) se exact UTR + amount match
+    if (cashier && cashier.type === 'amazon' && cashier.gmail_app_password) {
+      // Amazon Pay: history service (provider filter ke saath) se exact UTR + amount match
       const { getFamPayHistory } = require('../services/history.service');
       const { decryptAppPassword } = require('../services/checkout.service');
       let scan;

@@ -513,7 +513,7 @@ router.post('/:linkId/verify', async (req, res) => {
       if (paytmService.isPaid(r, session.session_id, expectedAmount) && [r.bankTxnId, r.txnId].includes(utr)) {
         verified = { messageId: null };
       }
-    } else if (cashier && ['fampay', 'amazon', 'paytm'].includes(cashier.type) && cashier.gmail_app_password) {
+    } else if (cashier && ['fampay', 'amazon'].includes(cashier.type) && cashier.gmail_app_password) {
       // Exact match only: typed UTR/Txn ID email ke UTR ya Transaction ID se bilkul same hona chahiye
       let scan;
       try {
