@@ -23,8 +23,9 @@ router.post('/google', async (req, res) => {
     const { data: userData, error: userError } = await supabase.auth.getUser(access_token);
 
     if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, message: 'Invalid Google token' });
-    }
+  console.error('[auth/google] getUser failed:', userError && userError.status, userError && userError.message);
+  return res.status(401).json({ success: false, message: 'Invalid Google token' });
+}
 
     const { email, user_metadata } = userData.user;
     const name = user_metadata?.full_name || user_metadata?.name || email.split('@')[0];
