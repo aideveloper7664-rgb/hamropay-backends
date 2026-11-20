@@ -45,27 +45,14 @@ router.post('/upgrade', authMiddleware, async (req, res) => {
 
     // plan_id = plan ka naam (BASIC...) ya plans table ki UUID
     let target = P.lookup(key);
-    let planRowId = null;
     if (!target) {
       const { data: byId } = await supabase.from('plans').select('id, name').eq('id', key).maybeSingle();
-      if (byId) { target = P.lookup(byId.name); planRowId = byId.id; }
+      if (byId) target = P.lookup(byId.name);
     }
     if (!target) return res.status(404).json({ success: false, message: 'Plan not found' });
-    if (target.price === 0) return res.status(400).json({ success: false, message: 'FREE plan is the default plan. It starts automatically when a paid plan ends.' });
 
-    const { plan: current, row, expires_at } = await P.getMerchantPlan(req.merchant.id);
-    // Chalu paid plan se sasta plan beech me nahi (paisa waste hoga). Upgrade ya same plan renew allowed.
-    if (current.price > 0 && target.rank < current.rank) {
-      return res.status(400).json({
-        success: false,
-        message: `Your ${current.name} plan is active until ${new Date(expires_at).toLocaleDateString('en-IN')}. You can switch to ${target.name} after it ends.`
-      });
-    }
-
-    if (!planRowId) {
-      const { data: pr } = await supabase.from('plans').select('id').eq('name', target.name).maybeSingle();
-      planRowId = pr ? pr.id : null;
-    }
+    const can = await P.checkCanBuy(req.merchant.id, target);
+    if (!can.ok) return res.status(400).json({ success: false, message: can.message });
 
     const { data: wallet } = await supabase.from('wallets').select('balance').eq('merchant_id', req.merchant.id).maybeSingle();
     const balance = wallet ? Number(wallet.balance) : 0;
@@ -81,24 +68,15 @@ router.post('/upgrade', authMiddleware, async (req, res) => {
       return res.status(409).json({ success: false, message: 'Balance changed, please try again.' });
     }
 
-    // Same plan renew = baaki bacha time + 30 din; warna aaj se 30 din
-    const base = current.name === target.name && expires_at && new Date(expires_at) > new Date() ? new Date(expires_at).getTime() : Date.now();
-    const newExpiry = new Date(base + P.DURATION_DAYS * P.DAY).toISOString();
-    const nowIso = new Date().toISOString();
-    const fields = { plan_name: target.name, expires_at: newExpiry, links_used: 0, withdrawals_used: 0, cycle_started_at: nowIso };
-    if (planRowId) fields.plan_id = planRowId;
-
-    let err;
-    if (row) ({ error: err } = await supabase.from('merchant_plans').update(fields).eq('merchant_id', req.merchant.id));
-    else ({ error: err } = await supabase.from('merchant_plans').insert([{ merchant_id: req.merchant.id, ...fields }]));
-
-    if (err) {
+    let activated;
+    try {
+      activated = await P.activatePlan(req.merchant.id, target);
+    } catch (e) {
       // Plan set na ho paya -> paisa wapas
-      await supabase.from('wallets').update({ balance: balance, updated_at: nowIso }).eq('merchant_id', req.merchant.id);
+      await supabase.from('wallets').update({ balance: balance, updated_at: new Date().toISOString() }).eq('merchant_id', req.merchant.id);
       return res.status(500).json({ success: false, message: 'Could not activate the plan. Your Hamro Cash was not charged.' });
     }
-
-    await supabase.from('merchants').update({ plan_name: target.name, plan_expires_at: newExpiry }).eq('id', req.merchant.id);
+    const newExpiry = activated.expires_at;
 
     return res.json({
       success: true,

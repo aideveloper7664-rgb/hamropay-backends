@@ -37,6 +37,8 @@ const TABLES = {
   plans: {},
   merchant_plans: {},
   merchant_webhooks: {},
+  billing_orders: {},
+  platform_account: {},
   promo_codes: {},
   promo_usage: {},
   referrals: {},
@@ -368,6 +370,43 @@ router.post('/data/merchants/:id/reset-password', dbAdminMiddleware, async (req,
   } catch (err) {
     return fail(res, 500, err.message);
   }
+});
+
+// ---------- Platform FamPay account (merchants yahin payment karte hain: plan / credits) ----------
+router.get('/platform-account', dbAdminMiddleware, async (req, res) => {
+  try {
+    const { data } = await supabase.from('platform_account').select('*').eq('is_active', true).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    return ok(res, data ? maskRow(data) : null);
+  } catch (err) { return fail(res, 500, err.message); }
+});
+
+// body: { upi_id, name?, gmail_email, gmail_app_password } (app password sirf badalna ho to bhejo). Gmail login asli me check hota hai.
+router.put('/platform-account', dbAdminMiddleware, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const upi = String(b.upi_id || '').trim();
+    const email = String(b.gmail_email || '').trim().toLowerCase();
+    const pass = String(b.gmail_app_password || '').replace(/\s/g, '');
+    if (!/^[A-Za-z0-9._-]{2,}@[A-Za-z0-9]{2,}$/.test(upi)) return fail(res, 400, 'Enter a valid UPI ID (like 9876543210@fam)');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fail(res, 400, 'Enter a valid Gmail address');
+    const { data: cur } = await supabase.from('platform_account').select('*').eq('is_active', true).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!cur && pass.length < 8) return fail(res, 400, 'Gmail App Password required');
+    const { encryptSecret, decryptAppPassword } = require('../services/checkout.service');
+    const { verifyGmailLogin, friendlyError } = require('../services/history.service');
+    const usePass = pass.length >= 8 ? pass : decryptAppPassword(cur.gmail_app_password);
+    try { await verifyGmailLogin(email, usePass); } catch (e) { return fail(res, 400, (friendlyError(e) || {}).message || 'Gmail login failed. Check email and App Password.'); }
+    const row = { upi_id: upi, name: String(b.name || 'HamroPay').trim().slice(0, 40), gmail_email: email, is_active: true, ...(pass.length >= 8 ? { gmail_app_password: encryptSecret(pass) } : {}) };
+    let saved;
+    if (cur) {
+      const { data, error } = await supabase.from('platform_account').update(row).eq('id', cur.id).select().single();
+      if (error) throw error; saved = data;
+    } else {
+      const { data, error } = await supabase.from('platform_account').insert([{ ...row, gmail_app_password: encryptSecret(pass) }]).select().single();
+      if (error) throw error; saved = data;
+    }
+    await audit(req, 'platform_account_set', 'platform_account', saved.id, cur, saved);
+    return ok(res, maskRow(saved), { message: 'Platform payment account saved' });
+  } catch (err) { return fail(res, 500, err.message); }
 });
 
 module.exports = router;

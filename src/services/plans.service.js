@@ -183,6 +183,34 @@ function effectiveBrandingMerchant(merchant, plan) {
   return m;
 }
 
+// Kya merchant ye plan kharid sakta hai? (chalu paid plan se sasta nahi)
+async function checkCanBuy(merchantId, target) {
+  if (!target || target.price <= 0) return { ok: false, message: 'FREE plan is the default plan. It starts automatically when a paid plan ends.' };
+  const { plan: current, expires_at } = await getMerchantPlan(merchantId);
+  if (current.price > 0 && target.rank < current.rank) {
+    return { ok: false, message: `Your ${current.name} plan is active until ${new Date(expires_at).toLocaleDateString('en-IN')}. You can switch to ${target.name} after it ends.` };
+  }
+  return { ok: true, current, expires_at };
+}
+
+// Plan chalu karo (payment ho chuka). Same plan renew = baaki time + 30 din, warna aaj se 30 din.
+async function activatePlan(merchantId, target) {
+  const { plan: current, row, expires_at } = await getMerchantPlan(merchantId);
+  let planRowId = null;
+  const { data: pr } = await supabase.from('plans').select('id').eq('name', target.name).maybeSingle();
+  if (pr) planRowId = pr.id;
+  const base = current.name === target.name && expires_at && new Date(expires_at) > new Date() ? new Date(expires_at).getTime() : Date.now();
+  const newExpiry = new Date(base + DURATION_DAYS * DAY).toISOString();
+  const fields = { plan_name: target.name, expires_at: newExpiry, links_used: 0, withdrawals_used: 0, cycle_started_at: new Date().toISOString() };
+  if (planRowId) fields.plan_id = planRowId;
+  let error;
+  if (row) ({ error } = await supabase.from('merchant_plans').update(fields).eq('merchant_id', merchantId));
+  else ({ error } = await supabase.from('merchant_plans').insert([{ merchant_id: merchantId, ...fields }]));
+  if (error) throw error;
+  await supabase.from('merchants').update({ plan_name: target.name, plan_expires_at: newExpiry }).eq('id', merchantId);
+  return { expires_at: newExpiry };
+}
+
 // PlanError ho to JSON response bhej do aur true return karo
 function fail(res, err) {
   if (err instanceof PlanError) {
@@ -200,5 +228,5 @@ module.exports = {
   PLANS, ORDER, DURATION_DAYS, DAY, PlanError, lookup, getMerchantPlan,
   assertAmount, assertApi, assertFeature, assertAccountType, assertAccountCount, accountLimit,
   linkExpiryDate, commissionPercent, reserveLink, releaseLink,
-  listWebhookUrls, sendWebhooks, effectiveBrandingMerchant, publicPlan, fail
+  listWebhookUrls, sendWebhooks, effectiveBrandingMerchant, publicPlan, fail, checkCanBuy, activatePlan
 };
