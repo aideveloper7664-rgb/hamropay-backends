@@ -28,7 +28,7 @@ router.get('/balance', authMiddleware, async (req, res) => {
         balance: wallet.balance || 0,
         total_earned: wallet.total_earned || 0,
         wallet_limit: merchantPlan?.plans?.wallet_limit || 500,
-        plan_name: merchantPlan?.plan_name || 'Blaze'
+        plan_name: merchantPlan?.plan_name || 'FREE'
       }
     });
   } catch (err) {

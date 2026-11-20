@@ -36,6 +36,7 @@ const TABLES = {
   settings: {},
   plans: {},
   merchant_plans: {},
+  merchant_webhooks: {},
   promo_codes: {},
   promo_usage: {},
   referrals: {},

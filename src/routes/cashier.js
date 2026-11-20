@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
+const P = require('../services/plans.service');
 require('dotenv').config();
 
 // Does this merchant already have an active cashier?
@@ -66,8 +67,9 @@ function addEmailCashier(type) {
         .eq('merchant_id', req.merchant.id)
         .eq('type', type);
 
-      if (existing && existing.length >= 3) {
-        return res.status(400).json({ success: false, message: `Max 3 ${label} accounts allowed` });
+      {
+        const { plan } = await P.getMerchantPlan(req.merchant.id);
+        try { P.assertAccountCount(plan, type, (existing || []).length, label); } catch (e) { if (P.fail(res, e)) return; throw e; }
       }
       if (existing && existing.some((a) => a.upi_id === cleanUpi || String(a.gmail_email || '').toLowerCase() === cleanEmail)) {
         return res.status(400).json({ success: false, message: 'This UPI ID or Gmail is already connected' });
@@ -177,8 +179,9 @@ const addPaytmMid = async (req, res) => {
       .eq('merchant_id', req.merchant.id)
       .eq('type', 'paytm_mid');
 
-    if (existing && existing.length >= 3) {
-      return res.status(400).json({ success: false, message: 'Max 3 Paytm accounts allowed' });
+    {
+      const { plan } = await P.getMerchantPlan(req.merchant.id);
+      try { P.assertAccountCount(plan, 'paytm_mid', (existing || []).length, 'Paytm'); } catch (e) { if (P.fail(res, e)) return; throw e; }
     }
     if (existing && existing.some((a) => a.upi_id === cleanUpi || a.paytm_mid === cleanMid)) {
       return res.status(400).json({ success: false, message: 'This UPI ID or Merchant ID is already connected' });
@@ -224,13 +227,17 @@ router.patch('/:id/toggle', authMiddleware, async (req, res) => {
     // Account must belong to this merchant
     const { data: target } = await supabase
       .from('cashier_accounts')
-      .select('id')
+      .select('id, type')
       .eq('id', req.params.id)
       .eq('merchant_id', req.merchant.id)
       .maybeSingle();
 
     if (!target) {
       return res.status(404).json({ success: false, message: 'Account not found' });
+    }
+    {
+      const { plan } = await P.getMerchantPlan(req.merchant.id);
+      try { P.assertAccountType(plan, target.type, target.type); } catch (e) { if (P.fail(res, e)) return; throw e; }
     }
 
     // Only ONE active cashier per merchant

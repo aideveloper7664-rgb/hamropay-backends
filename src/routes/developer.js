@@ -5,6 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
 const { resolveBranding } = require('../services/themes');
+const P = require('../services/plans.service');
 const { MAX_PAISE_SLOTS, round2, buildUpiUri, getActiveCashier, evaluateSession } = require('../services/checkout.service');
 
 const ORDER_MINUTES = 15;                                         // developer order kitni der valid rahe
@@ -43,7 +44,13 @@ async function devAuth(req, res, next) {
     if (merchant.is_active === false) {
       return res.status(403).json({ success: false, message: 'This account has been suspended.', banned: true });
     }
+    // PLAN: FREE (aur expired plan) me API access nahi
+    const { plan } = await P.getMerchantPlan(merchant.id);
+    if (!plan.api_orders) {
+      return res.status(403).json({ success: false, code: 'PLAN_API_DISABLED', message: `API access is not included in the ${plan.name} plan. Upgrade to BASIC or higher.` });
+    }
     req.merchant = merchant;
+    req.plan = plan;
     next();
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -56,7 +63,7 @@ function genOrderId() {
   return 'HP' + Date.now() + rand;
 }
 
-function validateCreateOrder(body) {
+function validateCreateOrder(body, cap = MAX_AMOUNT, planName = '') {
   const errors = [];
   const out = {};
 
@@ -64,8 +71,8 @@ function validateCreateOrder(body) {
   let n = NaN;
   if (typeof body.amount === 'number') n = body.amount;
   else if (typeof body.amount === 'string' && /^\d+(\.\d{1,2})?$/.test(body.amount.trim())) n = Number(body.amount.trim());
-  if (!Number.isFinite(n) || n < MIN_AMOUNT || n > MAX_AMOUNT) {
-    errors.push({ field: 'amount', msg: `Amount must be a plain number between ₹${MIN_AMOUNT} and ₹${MAX_AMOUNT.toLocaleString('en-IN')}` });
+  if (!Number.isFinite(n) || n < MIN_AMOUNT || n > cap) {
+    errors.push({ field: 'amount', msg: cap === Infinity ? `Amount must be a plain number of at least ₹${MIN_AMOUNT}` : `Amount must be a plain number between ₹${MIN_AMOUNT} and ₹${cap.toLocaleString('en-IN')}${planName ? ` (${planName} plan limit)` : ''}` });
   } else if (round2(n) !== n) {
     errors.push({ field: 'amount', msg: 'Amount can have at most 2 decimal places' });
   } else out.amount = n;
@@ -123,7 +130,7 @@ async function findApiOrder(orderId, merchantId = null) {
 // Create order
 router.post('/create-order', devAuth, async (req, res) => {
   try {
-    const v = validateCreateOrder(req.body || {});
+    const v = validateCreateOrder(req.body || {}, req.plan.max_amount === null ? Infinity : req.plan.max_amount, req.plan.name);
     if (v.errors.length) {
       return res.status(400).json({ success: false, message: 'Validation failed', errors: v.errors });
     }
@@ -138,11 +145,12 @@ router.post('/create-order', devAuth, async (req, res) => {
 
       const cashier = await getActiveCashier(m.id);
       if (!cashier) {
-        return res.status(400).json({ success: false, message: 'Please connect FamPay or Paytm account first to accept payments' });
+        return res.status(400).json({ success: false, message: 'Please connect a FamPay, Amazon Pay or Paytm account first to accept payments' });
       }
+      try { P.assertAccountType(req.plan, cashier.type, cashier.type); } catch (e) { if (P.fail(res, e)) return; throw e; }
 
       const { data: credit } = await supabase.from('hamro_credits').select('balance').eq('merchant_id', m.id).maybeSingle();
-      if (!credit || credit.balance <= 0) {
+      if (req.plan.commission > 0 && (!credit || credit.balance <= 0)) {
         return res.status(400).json({ success: false, message: 'Insufficient Hamro Credits. Please purchase more credits.' });
       }
 
@@ -250,7 +258,7 @@ router.get('/public-order/:orderId', async (req, res) => {
       pay_amount: Number(s.pay_amount),
       status,
       merchant_name: (merchant && merchant.name) || '',
-      branding: resolveBranding(merchant),
+      branding: resolveBranding(P.effectiveBrandingMerchant(merchant, (await P.getMerchantPlan(s.merchant_id)).plan)),
       is_test: !!s.is_test,
       embedded: !!s.embedded,
       expires_at: s.expires_at,
@@ -346,13 +354,9 @@ router.post('/test-action/:orderId', async (req, res) => {
     if (!updated) return res.status(400).json({ success: false, message: 'This order is already completed' });
 
     if (action === 'success') {
-      const { data: merchant } = await supabase.from('merchants').select('webhook_url').eq('id', s.merchant_id).maybeSingle();
-      if (merchant && merchant.webhook_url) {
-        fetch(merchant.webhook_url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ event: 'payment.test', test: true, order_id: s.session_id, link_id: null, utr: patch.utr, amount: Number(s.base_amount) })
-        }).catch(() => {});
+      const { data: merchant } = await supabase.from('merchants').select('id, webhook_url').eq('id', s.merchant_id).maybeSingle();
+      if (merchant) {
+        P.sendWebhooks(merchant, { event: 'payment.test', test: true, order_id: s.session_id, link_id: null, utr: patch.utr, amount: Number(s.base_amount) });
       }
     }
 
@@ -422,50 +426,67 @@ router.post('/mode', authMiddleware, async (req, res) => {
 // Get webhooks
 router.get('/webhooks', authMiddleware, async (req, res) => {
   try {
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    const { urls } = await P.listWebhookUrls(req.merchant);
     return res.json({
       success: true,
-      data: req.merchant.webhook_url
-        ? [{ url: req.merchant.webhook_url, events: ['payment.success', 'payment.test'] }]
-        : []
+      data: urls.map((url) => ({ url, events: ['payment.success', 'payment.test'] })),
+      limit: plan.webhooks,
+      enabled: plan.api_orders
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Add/Update webhook
+// Add webhook (plan ki limit tak; same URL dobara add nahi hota)
 router.post('/webhooks', authMiddleware, async (req, res) => {
   try {
-    const { url } = req.body;
+    const { url } = req.body || {};
 
     if (!url) {
       return res.status(400).json({ success: false, message: 'Webhook URL required' });
     }
     let ok = false;
-    try { ok = ['http:', 'https:'].includes(new URL(String(url)).protocol); } catch { ok = false; }
+    try { ok = ['http:', 'https:'].includes(new URL(String(url)).protocol) && String(url).length <= 500; } catch { ok = false; }
     if (!ok) {
       return res.status(400).json({ success: false, message: 'Webhook URL must be a valid http(s) URL' });
     }
 
-    await supabase
-      .from('merchants')
-      .update({ webhook_url: String(url) })
-      .eq('id', req.merchant.id);
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    if (!plan.api_orders || plan.webhooks === 0) {
+      return res.status(403).json({ success: false, code: 'PLAN_WEBHOOK_LIMIT', message: `Webhooks are not included in the ${plan.name} plan. Upgrade to BASIC or higher.` });
+    }
+    const { urls } = await P.listWebhookUrls(req.merchant);
+    if (urls.includes(String(url))) {
+      return res.status(400).json({ success: false, message: 'This webhook URL is already added' });
+    }
+    if (plan.webhooks !== null && urls.length >= plan.webhooks) {
+      return res.status(403).json({ success: false, code: 'PLAN_WEBHOOK_LIMIT', message: `${plan.name} plan allows ${plan.webhooks} webhook${plan.webhooks > 1 ? 's' : ''}. Upgrade your plan or remove one.` });
+    }
 
-    return res.json({ success: true, message: 'Webhook updated' });
+    const { error } = await supabase.from('merchant_webhooks').insert([{ merchant_id: req.merchant.id, url: String(url) }]);
+    if (error) throw error;
+
+    return res.json({ success: true, message: 'Webhook added', total: urls.length + 1, limit: plan.webhooks });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Delete webhook
+// Delete webhook: body/query "url" se ek, kuch na do to sab hata do
 router.delete('/webhooks', authMiddleware, async (req, res) => {
   try {
-    await supabase
-      .from('merchants')
-      .update({ webhook_url: null })
-      .eq('id', req.merchant.id);
-
+    const url = (req.body && req.body.url) || req.query.url || null;
+    if (url) {
+      await supabase.from('merchant_webhooks').delete().eq('merchant_id', req.merchant.id).eq('url', String(url));
+      if (req.merchant.webhook_url === String(url)) {
+        await supabase.from('merchants').update({ webhook_url: null }).eq('id', req.merchant.id);
+      }
+    } else {
+      await supabase.from('merchant_webhooks').delete().eq('merchant_id', req.merchant.id);
+      await supabase.from('merchants').update({ webhook_url: null }).eq('id', req.merchant.id);
+    }
     return res.json({ success: true, message: 'Webhook removed' });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });

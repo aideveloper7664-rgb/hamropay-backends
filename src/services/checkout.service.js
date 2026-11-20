@@ -51,9 +51,12 @@ async function getActiveCashier(merchantId) {
 }
 
 // Payment confirm hone ke baad sab kuch yahin hota hai.
+const P = require('./plans.service');
+
 // Payment-link payment: link diya hota hai. Developer API order: link = null, orderCode = 'HP...'
 async function settlePayment({ link = null, merchant, payAmount, utr, messageId, orderCode = null }) {
-  const commissionPercent = merchant.commission || 2;
+  const { plan: merchantPlan } = await P.getMerchantPlan(merchant.id);
+  const commissionPercent = P.commissionPercent(merchantPlan);   // plan se (ELITE = 0%)
   // Paisa seedha merchant ke apne UPI me aata hai (Hamro Cash / wallet nahi). Isliye merchant ko poora payAmount milta hai.
   // Commission alag se Hamro Credits se kati jaati hai.
   const commission = round2((payAmount * commissionPercent) / 100);
@@ -65,7 +68,7 @@ async function settlePayment({ link = null, merchant, payAmount, utr, messageId,
     .eq('merchant_id', merchant.id)
     .single();
 
-  if (!credit || credit.balance < commission) {
+  if (commission > 0 && (!credit || credit.balance < commission)) {
     return { ok: false, status: 400, message: 'Insufficient Hamro Credits. Please purchase more credits.' };
   }
 
@@ -99,19 +102,21 @@ async function settlePayment({ link = null, merchant, payAmount, utr, messageId,
     return { ok: false, status: 400, message: 'UTR already used' };
   }
 
-  await supabase.from('hamro_credits').update({
-    balance: round2(credit.balance - commission),
-    total_spent: round2((credit.total_spent || 0) + commission),
-    updated_at: new Date().toISOString()
-  }).eq('merchant_id', merchant.id);
+  if (commission > 0 && credit) {
+    await supabase.from('hamro_credits').update({
+      balance: round2(credit.balance - commission),
+      total_spent: round2((credit.total_spent || 0) + commission),
+      updated_at: new Date().toISOString()
+    }).eq('merchant_id', merchant.id);
 
-  await supabase.from('credit_transactions').insert([{
-    merchant_id: merchant.id,
-    type: 'deduct',
-    amount: commission,
-    order_id: orderId,
-    note: link ? `Commission for link ${link.link_id}` : `Commission for order ${orderId}`
-  }]);
+    await supabase.from('credit_transactions').insert([{
+      merchant_id: merchant.id,
+      type: 'deduct',
+      amount: commission,
+      order_id: orderId,
+      note: link ? `Commission for link ${link.link_id}` : `Commission for order ${orderId}`
+    }]);
+  }
 
   if (link) {
     await supabase.from('payment_links').update({
@@ -120,21 +125,15 @@ async function settlePayment({ link = null, merchant, payAmount, utr, messageId,
     }).eq('link_id', link.link_id);
   }
 
-  if (merchant.webhook_url) {
-    fetch(merchant.webhook_url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'payment.success',
-        order_id: orderId,
-        link_id: link ? link.link_id : null,
-        utr,
-        amount: payAmount,
-        net_amount: netAmount,
-        commission
-      })
-    }).catch(() => {});
-  }
+  P.sendWebhooks(merchant, {
+    event: 'payment.success',
+    order_id: orderId,
+    link_id: link ? link.link_id : null,
+    utr,
+    amount: payAmount,
+    net_amount: netAmount,
+    commission
+  });
 
   return { ok: true, data: { order_id: orderId, utr, amount: payAmount, net_amount: netAmount, commission } };
 }

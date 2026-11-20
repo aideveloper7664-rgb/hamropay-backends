@@ -2,143 +2,141 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
-const { adminMiddleware } = require('../middleware/auth');
+const P = require('../services/plans.service');
 
-// Upgrade plan via Hamro Cash
-router.post('/upgrade', authMiddleware, async (req, res) => {
+// Public: 7 plans ki poori list (pricing page)
+router.get('/', (req, res) => {
+  return res.json({ success: true, data: P.ORDER.map((k) => P.publicPlan(P.PLANS[k])) });
+});
+
+// Merchant: abhi ka plan + is cycle ka usage
+router.get('/current', authMiddleware, async (req, res) => {
   try {
-    const { plan_id } = req.body;
-
-    if (!plan_id) {
-      return res.status(400).json({ success: false, message: 'plan_id required' });
-    }
-
-    // Get plan by ID or name
-    let planQuery = supabase.from('plans').select('*').eq('is_active', true);
-    
-    // Check if UUID or name
-    if (plan_id.length < 10) {
-      planQuery = planQuery.eq('name', plan_id);
-    } else if (plan_id.includes('-')) {
-      planQuery = planQuery.eq('id', plan_id);
-    } else {
-      planQuery = planQuery.eq('name', plan_id);
-    }
-
-    const { data: plan, error: planError } = await planQuery.single();
-
-    if (planError || !plan) {
-      return res.status(404).json({ success: false, message: 'Plan not found' });
-    }
-
-    if (plan.price === 0) {
-      return res.status(400).json({ success: false, message: 'Already on free plan' });
-    }
-
-    // Check Hamro Cash balance
-    const { data: wallet } = await supabase
-      .from('wallets')
-      .select('balance')
-      .eq('merchant_id', req.merchant.id)
-      .single();
-
-    if (!wallet || wallet.balance < plan.price) {
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient Hamro Cash. Need ₹${plan.price}, have ₹${wallet?.balance || 0}`
-      });
-    }
-
-    // Deduct from Hamro Cash
-    await supabase
-      .from('wallets')
-      .update({
-        balance: wallet.balance - plan.price,
-        updated_at: new Date().toISOString()
-      })
-      .eq('merchant_id', req.merchant.id);
-
-    const expiresAt = new Date(Date.now() + plan.duration_days * 24 * 60 * 60 * 1000).toISOString();
-
-    const { data: existing } = await supabase
-      .from('merchant_plans')
-      .select('id')
-      .eq('merchant_id', req.merchant.id)
-      .single();
-
-    if (existing) {
-      await supabase
-        .from('merchant_plans')
-        .update({
-          plan_id: plan.id,
-          plan_name: plan.name,
-          expires_at: expiresAt,
-          links_used: 0,
-          withdrawals_used: 0
-        })
-        .eq('merchant_id', req.merchant.id);
-    } else {
-      await supabase
-        .from('merchant_plans')
-        .insert([{
-          merchant_id: req.merchant.id,
-          plan_id: plan.id,
-          plan_name: plan.name,
-          expires_at: expiresAt
-        }]);
-    }
-
-    await supabase
-      .from('merchants')
-      .update({ plan_name: plan.name, plan_expires_at: expiresAt })
-      .eq('id', req.merchant.id);
-
+    const { plan, expired, row, expires_at } = await P.getMerchantPlan(req.merchant.id);
+    const { urls } = await P.listWebhookUrls(req.merchant);
+    const { data: accts } = await supabase.from('cashier_accounts').select('type').eq('merchant_id', req.merchant.id);
+    const used = { fampay: 0, paytm_mid: 0, amazon: 0 };
+    (accts || []).forEach((a) => { if (used[a.type] !== undefined) used[a.type] += 1; });
     return res.json({
       success: true,
-      message: `Upgraded to ${plan.name} plan successfully!`,
-      data: { plan_name: plan.name, expires_at: expiresAt }
+      data: {
+        plan: P.publicPlan(plan),
+        expires_at,
+        expired_recently: expired,
+        usage: {
+          links_used: row ? Number(row.links_used) || 0 : 0,
+          links_limit: plan.links_per_month,
+          webhooks_used: urls.length,
+          webhooks_limit: plan.webhooks,
+          accounts_used: used
+        }
+      }
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
-module.exports = router;
 
+// Upgrade / renew via Hamro Cash (wallet balance). Sab plans 30 din ke.
+router.post('/upgrade', authMiddleware, async (req, res) => {
+  try {
+    const key = String((req.body && (req.body.plan_id || req.body.plan || req.body.plan_name)) || '').trim();
+    if (!key) return res.status(400).json({ success: false, message: 'plan_id required' });
 
-const checkPlanLimits = async (merchant_id, action) => {
-  const { data: merchantPlan } = await supabase
-    .from('merchant_plans')
-    .select('*, plans(*)')
-    .eq('merchant_id', merchant_id)
-    .single();
-
-  if (!merchantPlan) return { allowed: true };
-
-  const plan = merchantPlan.plans;
-
-  if (action === 'create_link') {
-    if (plan.links_limit !== -1 && merchantPlan.links_used >= plan.links_limit) {
-      return { allowed: false, message: `Payment link limit reached (${plan.links_limit}/month). Upgrade your plan.` };
+    // plan_id = plan ka naam (BASIC...) ya plans table ki UUID
+    let target = P.lookup(key);
+    let planRowId = null;
+    if (!target) {
+      const { data: byId } = await supabase.from('plans').select('id, name').eq('id', key).maybeSingle();
+      if (byId) { target = P.lookup(byId.name); planRowId = byId.id; }
     }
+    if (!target) return res.status(404).json({ success: false, message: 'Plan not found' });
+    if (target.price === 0) return res.status(400).json({ success: false, message: 'FREE plan is the default plan. It starts automatically when a paid plan ends.' });
+
+    const { plan: current, row, expires_at } = await P.getMerchantPlan(req.merchant.id);
+    // Chalu paid plan se sasta plan beech me nahi (paisa waste hoga). Upgrade ya same plan renew allowed.
+    if (current.price > 0 && target.rank < current.rank) {
+      return res.status(400).json({
+        success: false,
+        message: `Your ${current.name} plan is active until ${new Date(expires_at).toLocaleDateString('en-IN')}. You can switch to ${target.name} after it ends.`
+      });
+    }
+
+    if (!planRowId) {
+      const { data: pr } = await supabase.from('plans').select('id').eq('name', target.name).maybeSingle();
+      planRowId = pr ? pr.id : null;
+    }
+
+    const { data: wallet } = await supabase.from('wallets').select('balance').eq('merchant_id', req.merchant.id).maybeSingle();
+    const balance = wallet ? Number(wallet.balance) : 0;
+    if (balance < target.price) {
+      return res.status(400).json({ success: false, message: `Insufficient Hamro Cash. Need ₹${target.price}, have ₹${balance}` });
+    }
+
+    // Paisa kaato (balance badla ho to fail -> double spend nahi)
+    const { data: paid } = await supabase.from('wallets')
+      .update({ balance: Math.round((balance - target.price) * 100) / 100, updated_at: new Date().toISOString() })
+      .eq('merchant_id', req.merchant.id).eq('balance', wallet.balance).select();
+    if (!paid || !paid.length) {
+      return res.status(409).json({ success: false, message: 'Balance changed, please try again.' });
+    }
+
+    // Same plan renew = baaki bacha time + 30 din; warna aaj se 30 din
+    const base = current.name === target.name && expires_at && new Date(expires_at) > new Date() ? new Date(expires_at).getTime() : Date.now();
+    const newExpiry = new Date(base + P.DURATION_DAYS * P.DAY).toISOString();
+    const nowIso = new Date().toISOString();
+    const fields = { plan_name: target.name, expires_at: newExpiry, links_used: 0, withdrawals_used: 0, cycle_started_at: nowIso };
+    if (planRowId) fields.plan_id = planRowId;
+
+    let err;
+    if (row) ({ error: err } = await supabase.from('merchant_plans').update(fields).eq('merchant_id', req.merchant.id));
+    else ({ error: err } = await supabase.from('merchant_plans').insert([{ merchant_id: req.merchant.id, ...fields }]));
+
+    if (err) {
+      // Plan set na ho paya -> paisa wapas
+      await supabase.from('wallets').update({ balance: balance, updated_at: nowIso }).eq('merchant_id', req.merchant.id);
+      return res.status(500).json({ success: false, message: 'Could not activate the plan. Your Hamro Cash was not charged.' });
+    }
+
+    await supabase.from('merchants').update({ plan_name: target.name, plan_expires_at: newExpiry }).eq('id', req.merchant.id);
+
+    return res.json({
+      success: true,
+      message: `${target.name} plan activated for ${P.DURATION_DAYS} days!`,
+      data: { plan_name: target.name, expires_at: newExpiry, charged: target.price }
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
+});
 
-  if (action === 'withdraw') {
-    const weeklyLimit = plan.withdrawal_per_week;
-    if (weeklyLimit !== -1) {
-      const weekStart = new Date();
-      weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-      const { data: weeklyWithdrawals } = await supabase
-        .from('withdrawals')
-        .select('id')
-        .eq('merchant_id', merchant_id)
-        .gte('created_at', weekStart.toISOString());
-
-      if (weeklyWithdrawals && weeklyWithdrawals.length >= weeklyLimit) {
-        return { allowed: false, message: `Weekly withdrawal limit reached (${weeklyLimit}/week). Upgrade your plan.` };
+// Purana helper (wallet.js use karta hai): withdraw limit + link limit check
+const checkPlanLimits = async (merchant_id, action) => {
+  try {
+    if (action === 'create_link') {
+      const { plan, row } = await P.getMerchantPlan(merchant_id);
+      if (plan.links_per_month !== null && row && Number(row.links_used) >= plan.links_per_month) {
+        return { allowed: false, message: `Payment link limit reached (${plan.links_per_month}/month). Upgrade your plan.` };
+      }
+      return { allowed: true, plan };
+    }
+    if (action === 'withdraw') {
+      const { data: mp } = await supabase.from('merchant_plans').select('*, plans(*)').eq('merchant_id', merchant_id).maybeSingle();
+      const weeklyLimit = mp && mp.plans && mp.plans.withdrawal_per_week !== undefined && mp.plans.withdrawal_per_week !== null ? mp.plans.withdrawal_per_week : -1;
+      if (weeklyLimit !== -1) {
+        const weekStart = new Date();
+        weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+        const { data: weekly } = await supabase.from('withdrawals').select('id').eq('merchant_id', merchant_id).gte('created_at', weekStart.toISOString());
+        if (weekly && weekly.length >= weeklyLimit) {
+          return { allowed: false, message: `Weekly withdrawal limit reached (${weeklyLimit}/week). Upgrade your plan.` };
+        }
       }
     }
+    return { allowed: true };
+  } catch {
+    return { allowed: true };
   }
-
-  return { allowed: true, plan, merchantPlan };
 };
+
+module.exports = router;
 module.exports.checkPlanLimits = checkPlanLimits;

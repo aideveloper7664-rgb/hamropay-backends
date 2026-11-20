@@ -3,6 +3,7 @@ const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
+const P = require('../services/plans.service');
 
 // Create Order
 router.post('/create', authMiddleware, async (req, res) => {
@@ -199,12 +200,13 @@ router.post('/verify', authMiddleware, async (req, res) => {
       .single();
 
     // Calculate commission
-    const commissionPercent = req.merchant.commission || 2;
+    const { plan: mPlan } = await P.getMerchantPlan(req.merchant.id);
+    const commissionPercent = P.commissionPercent(mPlan);
     const commission = (order.amount * commissionPercent) / 100;
     const netAmount = order.amount - commission;
 
     // Check sufficient credits
-    if (!credit || credit.balance < commission) {
+    if (commission > 0 && (!credit || credit.balance < commission)) {
       return res.status(400).json({
         success: false,
         message: 'Insufficient Hamro Credits to process payment. Please purchase more credits.'
@@ -248,40 +250,36 @@ router.post('/verify', authMiddleware, async (req, res) => {
       })
       .eq('merchant_id', req.merchant.id);
 
-    // Deduct Hamro Credit (commission)
-    await supabase
-      .from('hamro_credits')
-      .update({
-        balance: credit.balance - commission,
-        total_spent: (credit.total_spent || 0) + commission,
-        updated_at: new Date().toISOString()
-      })
-      .eq('merchant_id', req.merchant.id);
-
-    // Save credit transaction
-    await supabase.from('credit_transactions').insert([{
-      merchant_id: req.merchant.id,
-      type: 'deduct',
-      amount: commission,
-      order_id: order_id,
-      note: `Commission deducted for order ${order_id}`
-    }]);
-
-    // Fire webhook
-    if (req.merchant.webhook_url) {
-      fetch(req.merchant.webhook_url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'payment.success',
-          order_id,
-          utr,
-          amount: order.amount,
-          net_amount: netAmount,
-          commission
+    if (commission > 0 && credit) {
+      // Deduct Hamro Credit (commission)
+      await supabase
+        .from('hamro_credits')
+        .update({
+          balance: credit.balance - commission,
+          total_spent: (credit.total_spent || 0) + commission,
+          updated_at: new Date().toISOString()
         })
-      }).catch(() => {});
+        .eq('merchant_id', req.merchant.id);
+
+      // Save credit transaction
+      await supabase.from('credit_transactions').insert([{
+        merchant_id: req.merchant.id,
+        type: 'deduct',
+        amount: commission,
+        order_id: order_id,
+        note: `Commission deducted for order ${order_id}`
+      }]);
     }
+
+    // Fire webhooks (plan ki limit tak)
+    P.sendWebhooks(req.merchant, {
+      event: 'payment.success',
+      order_id,
+      utr,
+      amount: order.amount,
+      net_amount: netAmount,
+      commission
+    });
 
     return res.json({
       success: true,

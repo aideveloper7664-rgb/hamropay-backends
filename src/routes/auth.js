@@ -23,9 +23,8 @@ router.post('/google', async (req, res) => {
     const { data: userData, error: userError } = await supabase.auth.getUser(access_token);
 
     if (userError || !userData?.user) {
-  console.error('[auth/google] getUser failed:', userError && userError.status, userError && userError.message);
-  return res.status(401).json({ success: false, message: 'Invalid Google token' });
-}
+      return res.status(401).json({ success: false, message: 'Invalid Google token' });
+    }
 
     const { email, user_metadata } = userData.user;
     const name = user_metadata?.full_name || user_metadata?.name || email.split('@')[0];
@@ -74,19 +73,19 @@ router.post('/google', async (req, res) => {
       }]);
 
       // Create default plan
-      const { data: blazePlan } = await supabase
+      const { data: freePlan } = await supabase
         .from('plans')
         .select('id')
-        .eq('name', 'Blaze')
-        .single();
+        .eq('name', 'FREE')
+        .maybeSingle();
 
-      if (blazePlan) {
-        await supabase.from('merchant_plans').insert([{
-          merchant_id: newMerchant.id,
-          plan_id: blazePlan.id,
-          plan_name: 'Blaze'
-        }]);
-      }
+      await supabase.from('merchant_plans').insert([{
+        merchant_id: newMerchant.id,
+        ...(freePlan ? { plan_id: freePlan.id } : {}),
+        plan_name: 'FREE',
+        links_used: 0,
+        cycle_started_at: new Date().toISOString()
+      }]);
 
       merchant = newMerchant;
     }

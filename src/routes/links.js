@@ -10,6 +10,10 @@ const {
   decryptAppPassword, buildUpiUri, getActiveCashier, settlePayment, evaluateSession, getFamPayHistory
 } = require('../services/checkout.service');
 const paytmService = require('../services/paytm.service');
+const P = require('../services/plans.service');
+
+const linkExpired = (l) => !!(l && l.expires_at && new Date(l.expires_at) <= new Date());
+const EXPIRED_BODY = { success: false, code: 'LINK_EXPIRED', message: 'This payment link has expired. Please ask the merchant for a new link.' };
 
 // Naye checkout sessions ki spam rokne ke liye (per link, per minute)
 const sessionHits = new Map();
@@ -34,6 +38,10 @@ router.post('/create', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
     }
 
+    // ----- PLAN: amount limit -----
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    try { P.assertAmount(plan, Number(amount), 'payment link'); } catch (e) { if (P.fail(res, e)) return; throw e; }
+
     // Check if merchant has active cashier
     const { data: cashier } = await supabase
       .from('cashier_accounts')
@@ -45,11 +53,15 @@ router.post('/create', authMiddleware, async (req, res) => {
       .maybeSingle();
 
     if (!cashier) {
+      if (Object.values(plan.accounts).every((v) => v === 0)) {
+        return res.status(403).json({ success: false, code: 'PLAN_ACCOUNT_LIMIT', message: `Payment accounts (FamPay / Paytm / Amazon Pay) cannot be connected on the ${plan.name} plan. Upgrade to BASIC or higher to accept payments.` });
+      }
       return res.status(400).json({
         success: false,
-        message: 'Please connect FamPay or Paytm account first to create payment links'
+        message: 'Please connect a FamPay, Amazon Pay or Paytm account first to create payment links'
       });
     }
+    try { P.assertAccountType(plan, cashier.type, cashier.type); } catch (e) { if (P.fail(res, e)) return; throw e; }
 
     // Check Hamro Credit balance
     const { data: credit } = await supabase
@@ -58,12 +70,16 @@ router.post('/create', authMiddleware, async (req, res) => {
       .eq('merchant_id', req.merchant.id)
       .single();
 
-    if (!credit || credit.balance <= 0) {
+    if (plan.commission > 0 && (!credit || credit.balance <= 0)) {
       return res.status(400).json({
         success: false,
         message: 'Insufficient Hamro Credits. Please purchase more credits.'
       });
     }
+
+    // ----- PLAN: monthly link quota (reserve karo; insert fail ho to wapas) -----
+    let slot;
+    try { slot = await P.reserveLink(req.merchant.id, plan); } catch (e) { if (P.fail(res, e)) return; throw e; }
 
     const linkId = 'lnk_' + uuidv4().replace(/-/g, '').slice(0, 16);
 
@@ -76,6 +92,7 @@ router.post('/create', authMiddleware, async (req, res) => {
         amount,
         note,
         status: 'active',
+        expires_at: P.linkExpiryDate(plan),
         is_test: is_test === true,
         total_collected: 0,
         total_orders: 0
@@ -83,7 +100,7 @@ router.post('/create', authMiddleware, async (req, res) => {
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) { await P.releaseLink(req.merchant.id, slot); throw error; }
 
     const paymentUrl = `${process.env.FRONTEND_URL || 'https://hamro-pay-kilj.vercel.app'}/pay/${linkId}`;
 
@@ -146,6 +163,9 @@ router.get('/:linkId', async (req, res) => {
       });
     }
 
+    if (linkExpired(data)) return res.status(410).json(EXPIRED_BODY);
+    const { plan: ownerPlan } = await P.getMerchantPlan(data.merchants.id);
+
     // Get merchant active cashier
     const { data: cashier } = await supabase
       .from('cashier_accounts')
@@ -171,7 +191,8 @@ router.get('/:linkId', async (req, res) => {
         status: data.status,
         is_test: !!data.is_test,
         merchant_name: data.merchants?.name || '',
-        branding: resolveBranding(data.merchants),
+        branding: resolveBranding(P.effectiveBrandingMerchant(data.merchants, ownerPlan)),
+        expires_at: data.expires_at || null,
         upi_id: cashier.upi_id,
         cashier_type: cashier.type,
         qr_code: `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=0&data=${encodeURIComponent(`upi://pay?pa=${cashier.upi_id}&pn=Payment&am=${data.amount}&cu=INR`)}`
@@ -211,6 +232,8 @@ router.patch('/:linkId', authMiddleware, async (req, res) => {
         return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
       }
       updates.amount = Number(amount);
+      const { plan: curPlan } = await P.getMerchantPlan(req.merchant.id);
+      try { P.assertAmount(curPlan, updates.amount, 'payment link'); } catch (e) { if (P.fail(res, e)) return; throw e; }
     }
     if (note !== undefined) updates.note = note;
 
@@ -274,12 +297,24 @@ router.post('/:linkId/session', async (req, res) => {
     if (link.status !== 'active') {
       return res.status(403).json({ success: false, code: 'LINK_DISABLED', message: 'This payment link is currently disabled by the merchant' });
     }
+    if (linkExpired(link)) return res.status(410).json(EXPIRED_BODY);
     // Test links me auto-detect nahi hota (wahan sirf test UTR chalta hai)
     if (link.is_test) return res.json({ success: true, test_mode: true, data: null });
 
     const cashier = await getActiveCashier(link.merchant_id);
     if (!cashier) {
       return res.status(409).json({ success: false, message: 'Merchant has no active payment account' });
+    }
+    // PLAN: merchant ka plan abhi bhi ye amount / ye account type allow karta hai? (downgrade ke baad bhi strict)
+    {
+      const { plan: ownerPlan } = await P.getMerchantPlan(link.merchant_id);
+      try {
+        P.assertAmount(ownerPlan, Number(link.amount), 'payment');
+        P.assertAccountType(ownerPlan, cashier.type, cashier.type);
+      } catch (e) {
+        if (e instanceof P.PlanError) return res.status(403).json({ success: false, code: 'MERCHANT_PLAN_LIMIT', message: 'This merchant cannot accept this payment right now. Please contact the merchant.' });
+        throw e;
+      }
     }
 
     const toPayload = (sess) => ({
@@ -431,6 +466,8 @@ router.post('/:linkId/verify', async (req, res) => {
       });
     }
 
+    if (linkExpired(link)) return res.status(410).json(EXPIRED_BODY);
+
     // ---------- TEST MODE: no Gmail check, no wallet, no credits, no DB writes ----------
     if (link.is_test) {
       const TEST_UTR = '000000000000';
@@ -444,19 +481,15 @@ router.post('/:linkId/verify', async (req, res) => {
 
       const testOrderId = 'TEST_' + uuidv4().replace(/-/g, '').toUpperCase().slice(0, 12);
 
-      if (link.merchants && link.merchants.webhook_url) {
-        fetch(link.merchants.webhook_url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            event: 'payment.test',
-            test: true,
-            order_id: testOrderId,
-            link_id: req.params.linkId,
-            utr: TEST_UTR,
-            amount: link.amount
-          })
-        }).catch(() => {});
+      if (link.merchants) {
+        P.sendWebhooks(link.merchants, {
+          event: 'payment.test',
+          test: true,
+          order_id: testOrderId,
+          link_id: req.params.linkId,
+          utr: TEST_UTR,
+          amount: link.amount
+        });
       }
 
       return res.json({

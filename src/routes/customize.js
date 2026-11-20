@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
 const T = require('../services/themes');
+const P = require('../services/plans.service');
 
 // Safe text: tags/control chars hatao, trim, length limit. Frontend ise text ki tarah hi dikhata hai.
 const cleanText = (v, max) => String(v).replace(/[<>\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
@@ -30,7 +31,8 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     const { data: m, error } = await supabase.from('merchants').select('*').eq('id', req.merchant.id).maybeSingle();
     if (error || !m) return res.status(404).json({ success: false, message: 'Merchant not found' });
-    return res.json({ success: true, data: { settings: settingsOf(m), branding: T.resolveBranding(m) } });
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    return res.json({ success: true, data: { settings: settingsOf(m), branding: T.resolveBranding(P.effectiveBrandingMerchant(m, plan)), access: { custom_pages: plan.custom_pages, qr_theme: plan.qr_theme, branding: plan.branding, plan: plan.name } } });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -42,6 +44,18 @@ router.put('/', authMiddleware, async (req, res) => {
     const b = req.body || {};
     const patch = {};
     const errors = [];
+
+    // PLAN: kaun si customization allowed hai
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    const wants = (k) => b[k] !== undefined && b[k] !== null && b[k] !== '';
+    const lookFields = ['theme', 'color', 'shape', 'font'].filter(wants);
+    const brandFields = ['brand_name', 'logo_url', 'footer'].filter(wants);
+    if (lookFields.length && !(plan.custom_pages || plan.qr_theme)) {
+      return res.status(403).json({ success: false, code: 'PLAN_FEATURE', message: `Custom payment pages & QR theme customization are available from the BUSINESS plan (you are on ${plan.name}).` });
+    }
+    if (brandFields.length && !plan.branding) {
+      return res.status(403).json({ success: false, code: 'PLAN_FEATURE', message: `Custom gateway branding (name, logo, footer) is available from the ADVANCE plan (you are on ${plan.name}).` });
+    }
 
     if (b.theme !== undefined) {
       if (!T.isValidTheme(b.theme)) errors.push({ field: 'theme', msg: 'Unknown theme' });
