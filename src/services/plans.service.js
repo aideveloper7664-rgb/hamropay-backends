@@ -17,21 +17,21 @@ const PLANS = {
   BASIC: {
     name: 'BASIC', price: 49, rank: 1,
     links_per_month: 250, link_expiry_days: 10, max_amount: 200, commission: 3.5,
-    webhooks: 5, api_orders: true, api_docs: false, advanced_api: false,
+    webhooks: 5, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 1, paytm_mid: 1, amazon: 1 },
     custom_pages: false, qr_theme: false, branding: false, multiple_pages: false
   },
   STARTER: {
     name: 'STARTER', price: 99, rank: 2,
     links_per_month: 1000, link_expiry_days: 30, max_amount: 500, commission: 3,
-    webhooks: 10, api_orders: true, api_docs: false, advanced_api: false,
+    webhooks: 10, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 1, paytm_mid: 1, amazon: 1 },
     custom_pages: false, qr_theme: false, branding: false, multiple_pages: false
   },
   GROWTH: {
     name: 'GROWTH', price: 199, rank: 3,
     links_per_month: 3000, link_expiry_days: 45, max_amount: 1000, commission: 2.5,
-    webhooks: 25, api_orders: true, api_docs: false, advanced_api: false,
+    webhooks: 25, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 2, paytm_mid: 2, amazon: 2 },
     custom_pages: false, qr_theme: false, branding: false, multiple_pages: false
   },
@@ -193,7 +193,7 @@ function fail(res, err) {
 }
 
 function publicPlan(p) {
-  return { ...p, accounts: { ...p.accounts }, duration_days: DURATION_DAYS };
+  return { ...p, developer_portal: !!p.api_orders, accounts: { ...p.accounts }, duration_days: DURATION_DAYS };
 }
 
 module.exports = {

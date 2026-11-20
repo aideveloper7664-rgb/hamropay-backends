@@ -368,8 +368,22 @@ router.post('/test-action/:orderId', async (req, res) => {
 
 // ======================= MERCHANT DASHBOARD (x-api-key) =======================
 
+// Developer portal sirf API wale plans ke liye (FREE me band): frontend ko 403 + PLAN_API_DISABLED milta hai -> "Upgrade" screen
+async function portalGuard(req, res, next) {
+  try {
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    if (!plan.api_orders) {
+      return res.status(403).json({ success: false, code: 'PLAN_API_DISABLED', message: `Developer portal is not included in the ${plan.name} plan. Upgrade to BASIC or higher.`, required_plan: 'BASIC' });
+    }
+    req.plan = plan;
+    next();
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+}
+
 // Get API token info
-router.get('/token', authMiddleware, async (req, res) => {
+router.get('/token', authMiddleware, portalGuard, async (req, res) => {
   try {
     return res.json({
       success: true,
@@ -385,7 +399,7 @@ router.get('/token', authMiddleware, async (req, res) => {
 });
 
 // Regenerate API key (purani key turant band ho jaati hai)
-router.post('/token/regenerate', authMiddleware, async (req, res) => {
+router.post('/token/regenerate', authMiddleware, portalGuard, async (req, res) => {
   try {
     const newKey = 'hmpay_' + uuidv4().replace(/-/g, '');
 
@@ -403,7 +417,7 @@ router.post('/token/regenerate', authMiddleware, async (req, res) => {
 });
 
 // Set mode (live/test): account-wide, create-order aur sab developer orders par lagu
-router.post('/mode', authMiddleware, async (req, res) => {
+router.post('/mode', authMiddleware, portalGuard, async (req, res) => {
   try {
     const { mode } = req.body;
 
@@ -494,7 +508,7 @@ router.delete('/webhooks', authMiddleware, async (req, res) => {
 });
 
 // Get API orders (saare statuses: pending / success / failed)
-router.get('/orders', authMiddleware, async (req, res) => {
+router.get('/orders', authMiddleware, portalGuard, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('checkout_sessions')
