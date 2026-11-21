@@ -8,49 +8,49 @@ const DURATION_DAYS = 30;
 
 const PLANS = {
   FREE: {
-    name: 'FREE', price: 0, rank: 0,
+    store_products: 5, name: 'FREE', price: 0, rank: 0,
     links_per_month: 50, link_expiry_days: 3, max_amount: 150, commission: 5,
     webhooks: 0, api_orders: false, api_docs: false, advanced_api: false,
     accounts: { fampay: 1, paytm_mid: 1, amazon: 1 },
     custom_pages: false, qr_theme: false, branding: false, multiple_pages: false
   },
   BASIC: {
-    name: 'BASIC', price: 49, rank: 1,
+    store_products: 25, name: 'BASIC', price: 49, rank: 1,
     links_per_month: 250, link_expiry_days: 10, max_amount: 200, commission: 3.5,
     webhooks: 5, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 1, paytm_mid: 1, amazon: 1 },
     custom_pages: false, qr_theme: false, branding: false, multiple_pages: false
   },
   STARTER: {
-    name: 'STARTER', price: 99, rank: 2,
+    store_products: 100, name: 'STARTER', price: 99, rank: 2,
     links_per_month: 1000, link_expiry_days: 30, max_amount: 500, commission: 3,
     webhooks: 10, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 1, paytm_mid: 1, amazon: 1 },
     custom_pages: false, qr_theme: false, branding: false, multiple_pages: false
   },
   GROWTH: {
-    name: 'GROWTH', price: 199, rank: 3,
+    store_products: 300, name: 'GROWTH', price: 199, rank: 3,
     links_per_month: 3000, link_expiry_days: 45, max_amount: 1000, commission: 2.5,
     webhooks: 25, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 2, paytm_mid: 2, amazon: 2 },
     custom_pages: false, qr_theme: false, branding: false, multiple_pages: false
   },
   BUSINESS: {
-    name: 'BUSINESS', price: 499, rank: 4,
+    store_products: 1000, name: 'BUSINESS', price: 499, rank: 4,
     links_per_month: 10000, link_expiry_days: 90, max_amount: 5000, commission: 2,
     webhooks: 50, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 2, paytm_mid: 2, amazon: 2 },
     custom_pages: true, qr_theme: true, branding: false, multiple_pages: false
   },
   ADVANCE: {
-    name: 'ADVANCE', price: 699, rank: 5,
+    store_products: null, name: 'ADVANCE', price: 699, rank: 5,
     links_per_month: null, link_expiry_days: null, max_amount: 10000, commission: 1,
     webhooks: null, api_orders: true, api_docs: true, advanced_api: false,
     accounts: { fampay: 3, paytm_mid: 3, amazon: 3 },
     custom_pages: true, qr_theme: true, branding: true, multiple_pages: true
   },
   ELITE: {
-    name: 'ELITE', price: 999, rank: 6,
+    store_products: null, name: 'ELITE', price: 999, rank: 6,
     links_per_month: null, link_expiry_days: null, max_amount: null, commission: 0,
     webhooks: null, api_orders: true, api_docs: true, advanced_api: true,
     accounts: { fampay: 3, paytm_mid: 3, amazon: 3 },

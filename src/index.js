@@ -27,6 +27,7 @@ app.use('/api/credits', require('./routes/credits'));
 app.use('/api/referral', require('./routes/referral'));
 app.use('/api/plans', require('./routes/plans'));
 app.use('/api/billing', require('./routes/billing'));
+app.use('/api/store', require('./routes/store'));
 app.use('/api/promo', require('./routes/promo'));
 app.use('/api/customize', require('./routes/customize'));
 
