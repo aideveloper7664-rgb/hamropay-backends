@@ -8,6 +8,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// API responses kabhi cache na ho (admin/DB me badlav turant frontend ko dikhe)
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/docs') && req.path !== '/hamropay-pay.js') res.set('Cache-Control', 'no-store');
+  next();
+});
+
 // Routes
 app.use('/auth', require('./routes/auth'));
 app.use('/order', require('./routes/order'));
