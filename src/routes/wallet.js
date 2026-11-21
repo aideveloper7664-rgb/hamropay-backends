@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
+const PL = require('../services/plans.service');
 const { checkPlanLimits } = require('./plans');
 
 // Get Wallet Balance
@@ -15,12 +16,13 @@ router.get('/balance', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    // Get plan info
+    // Get plan info (purana/unknown naam jaise "Blaze" ya expired plan -> FREE)
     const { data: merchantPlan } = await supabase
       .from('merchant_plans')
       .select('*, plans(*)')
       .eq('merchant_id', req.merchant.id)
-      .single();
+      .maybeSingle();
+    const effPlan = await PL.getMerchantPlan(req.merchant.id);
 
     return res.json({
       success: true,
@@ -28,7 +30,8 @@ router.get('/balance', authMiddleware, async (req, res) => {
         balance: wallet.balance || 0,
         total_earned: wallet.total_earned || 0,
         wallet_limit: merchantPlan?.plans?.wallet_limit || 500,
-        plan_name: merchantPlan?.plan_name || 'FREE'
+        plan_name: effPlan.plan.name,
+        plan_expires_at: effPlan.expires_at
       }
     });
   } catch (err) {

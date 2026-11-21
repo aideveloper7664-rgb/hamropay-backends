@@ -39,7 +39,7 @@ async function devAuth(req, res, next) {
       return res.status(401).json({ success: false, message: 'Missing HamroAPI key. Pass it as "hamro_api" in the request body or an "X-HamroAPI-Key" header.' });
     }
 
-    const { data: merchant } = await supabase.from('merchants').select('*').eq('api_key', String(key)).maybeSingle();
+    const { data: merchant } = await supabase.from('merchants').select('*').eq('developer_api_key', String(key)).maybeSingle();
     if (!merchant) return res.status(401).json({ success: false, message: 'Invalid HamroAPI key' });
     if (merchant.is_active === false) {
       return res.status(403).json({ success: false, message: 'This account has been suspended.', banned: true });
@@ -382,13 +382,14 @@ async function portalGuard(req, res, next) {
   }
 }
 
-// Get API token info
+// Get API token info. Developer API key tab tak nahi jab tak merchant khud "Generate" na kare (null).
 router.get('/token', authMiddleware, portalGuard, async (req, res) => {
   try {
     return res.json({
       success: true,
       data: {
-        api_key: req.merchant.api_key,
+        api_key: req.merchant.developer_api_key || null,
+        generated: !!req.merchant.developer_api_key,
         created_at: req.merchant.created_at,
         mode: req.merchant.mode || 'live'
       }
@@ -398,23 +399,19 @@ router.get('/token', authMiddleware, portalGuard, async (req, res) => {
   }
 });
 
-// Regenerate API key (purani key turant band ho jaati hai)
-router.post('/token/regenerate', authMiddleware, portalGuard, async (req, res) => {
+// Generate (pehli baar) / Regenerate: purani key turant band. Sirf API wale plans (portalGuard).
+async function generateKey(req, res) {
   try {
     const newKey = 'hmpay_' + uuidv4().replace(/-/g, '');
-
-    const { error } = await supabase
-      .from('merchants')
-      .update({ api_key: newKey })
-      .eq('id', req.merchant.id);
-
+    const { error } = await supabase.from('merchants').update({ developer_api_key: newKey }).eq('id', req.merchant.id);
     if (error) throw error;
-
-    return res.json({ success: true, data: { api_key: newKey } });
+    return res.json({ success: true, data: { api_key: newKey, generated: true } });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
-});
+}
+router.post('/token/generate', authMiddleware, portalGuard, generateKey);
+router.post('/token/regenerate', authMiddleware, portalGuard, generateKey);
 
 // Set mode (live/test): account-wide, create-order aur sab developer orders par lagu
 router.post('/mode', authMiddleware, portalGuard, async (req, res) => {

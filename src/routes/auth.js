@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const P = require('../services/plans.service');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
@@ -90,6 +91,8 @@ router.post('/google', async (req, res) => {
       merchant = newMerchant;
     }
 
+    const { plan: effPlan } = await P.getMerchantPlan(merchant.id);
+
     // Generate JWT
     const token = jwt.sign(
       { id: merchant.id, email: merchant.email, role: 'merchant' },
@@ -107,7 +110,9 @@ router.post('/google', async (req, res) => {
           name: merchant.name,
           email: merchant.email,
           api_key: merchant.api_key,
-          referral_code: merchant.referral_code
+          referral_code: merchant.referral_code,
+          plan_name: effPlan.name,
+          developer_api_key_generated: !!merchant.developer_api_key
         }
       }
     });
