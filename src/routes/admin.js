@@ -434,4 +434,7 @@ router.put('/platform-account', dbAdminMiddleware, async (req, res) => {
   } catch (err) { return fail(res, 500, err.message); }
 });
 
+// Purane admin routes (/stats, /withdrawals, /merchants, /settings) bhi isi router se: index.js me mount alag ho ya na ho, 404 nahi aayega
+router.use(require('./admin'));
+
 module.exports = router;
