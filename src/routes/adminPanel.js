@@ -77,6 +77,19 @@ function pkOf(req) {
   return COL_RE.test(pk) ? pk : null;
 }
 
+// Primary key khud pata karo: ?pk= diya ho to wahi, warna table ka "id" (na ho to merchant_id/key/code/name)
+async function resolvePk(req, table) {
+  if (req.query.pk) return pkOf(req);
+  try {
+    const { data } = await supabase.from(table).select('*').limit(1);
+    const keys = data && data[0] ? Object.keys(data[0]) : [];
+    if (!keys.length || keys.includes('id')) return 'id';
+    return ['merchant_id', 'key', 'code', 'name'].find((k) => keys.includes(k)) || 'id';
+  } catch { return 'id'; }
+}
+
+const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+
 async function audit(req, action, table, rowId, before, after) {
   try {
     const { error } = await supabase.from('admin_audit_log').insert([{
@@ -295,7 +308,7 @@ router.get('/data/:table', dbAdminMiddleware, async (req, res) => {
 
 router.get('/data/:table/:id', dbAdminMiddleware, async (req, res) => {
   const t = getTable(req, res); if (!t) return;
-  const pk = pkOf(req); if (!pk) return fail(res, 400, 'Bad pk');
+  const pk = await resolvePk(req, t.name); if (!pk) return fail(res, 400, 'Bad pk');
   const { data, error } = await supabase.from(t.name).select('*').eq(pk, req.params.id).maybeSingle();
   if (error) return fail(res, 400, error.message);
   if (!data) return fail(res, 404, 'Row not found');
@@ -307,11 +320,13 @@ function cleanBody(body, res, { forUpdate }) {
   const out = {};
   for (const [k, v] of Object.entries(body)) {
     if (!COL_RE.test(k)) { fail(res, 400, `Bad column name "${k}"`); return null; }
-    if (SECRET_COLUMNS.includes(k)) { fail(res, 400, `"${k}" cannot be edited here${k === 'password' ? ' (use reset-password)' : ''}`); return null; }
-    if (forUpdate && k === 'id') { fail(res, 400, 'id cannot be changed'); return null; }
+    if (SECRET_COLUMNS.includes(k)) {
+      if (forUpdate && v === MASK) continue;   // panel poori row bhejta hai: masked value ignore (badli nahi)
+      fail(res, 400, `"${k}" cannot be edited here${k === 'password' ? ' (use reset-password)' : ''}`); return null;
+    }
     out[k] = v;
   }
-  if (!Object.keys(out).length) { fail(res, 400, 'No fields provided'); return null; }
+  if (!Object.keys(out).length && !forUpdate) { fail(res, 400, 'No fields provided'); return null; }
   return out;
 }
 
@@ -328,24 +343,34 @@ router.post('/data/:table', dbAdminMiddleware, async (req, res) => {
 router.patch('/data/:table/:id', dbAdminMiddleware, async (req, res) => {
   const t = getTable(req, res); if (!t) return;
   if (t.readonly) return fail(res, 403, `"${t.name}" is read-only`);
-  const pk = pkOf(req); if (!pk) return fail(res, 400, 'Bad pk');
-  const patch = cleanBody(req.body, res, { forUpdate: true }); if (!patch) return;
+  const pk = await resolvePk(req, t.name); if (!pk) return fail(res, 400, 'Bad pk');
+  const sent = cleanBody(req.body, res, { forUpdate: true }); if (!sent) return;
 
   const { data: before, error: e1 } = await supabase.from(t.name).select('*').eq(pk, req.params.id).maybeSingle();
   if (e1) return fail(res, 400, e1.message);
   if (!before) return fail(res, 404, 'Row not found');
 
+  // Sirf asli badlav bhejo: id / jo value same hai wo skip (poori row bhejne par bhi chale)
+  const patch = {};
+  for (const [k, v] of Object.entries(sent)) {
+    if (k === pk || k === 'id') continue;
+    if (k in before && same(v, before[k])) continue;
+    patch[k] = v;
+  }
+  if (!Object.keys(patch).length) return ok(res, maskRow(before), { message: 'No changes to save', changed: [] });
+
   const { data, error } = await supabase.from(t.name).update(patch).eq(pk, req.params.id).select('*').maybeSingle();
   if (error) return fail(res, 400, error.message);
+  if (!data) return fail(res, 409, 'Update did not apply (row not found or blocked by database). Nothing was changed.');
   const logged = await audit(req, 'update', t.name, req.params.id, before, data);
-  return ok(res, maskRow(data), logged ? {} : { audit_warning: 'Change saved but audit log failed (run the admin SQL).' });
+  return ok(res, maskRow(data), { message: 'Saved', changed: Object.keys(patch), ...(logged ? {} : { audit_warning: 'Change saved but audit log failed (run the admin SQL).' }) });
 });
 
 router.delete('/data/:table/:id', dbAdminMiddleware, async (req, res) => {
   const t = getTable(req, res); if (!t) return;
   if (t.readonly) return fail(res, 403, `"${t.name}" is read-only`);
   if (req.query.confirm !== 'yes') return fail(res, 400, 'Add ?confirm=yes to delete (this cannot be undone)');
-  const pk = pkOf(req); if (!pk) return fail(res, 400, 'Bad pk');
+  const pk = await resolvePk(req, t.name); if (!pk) return fail(res, 400, 'Bad pk');
 
   const { data: before, error: e1 } = await supabase.from(t.name).select('*').eq(pk, req.params.id).maybeSingle();
   if (e1) return fail(res, 400, e1.message);
@@ -408,5 +433,11 @@ router.put('/platform-account', dbAdminMiddleware, async (req, res) => {
     return ok(res, maskRow(saved), { message: 'Platform payment account saved' });
   } catch (err) { return fail(res, 500, err.message); }
 });
+
+// Purane admin routes (/stats, /withdrawals, /merchants, /settings) bhi isi router se: index.js me mount alag ho ya na ho, 404 nahi aayega
+try {
+  const legacy = require('./admin');
+  if (typeof legacy === 'function' && legacy !== router) router.use(legacy);   // admin.js galat file ho (circular) to skip, crash nahi
+} catch (e) { console.error('[admin] legacy routes not loaded:', e.message); }
 
 module.exports = router;
