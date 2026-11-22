@@ -13,7 +13,7 @@
   var SAMPLES = {
     html: {
       label: 'HTML / JS', short: 'HT', name: 'index.html',
-      intro: 'Add the widget script, set your callbacks and call createOrder. The widget opens the payment popup and watches the order for you.',
+      intro: 'Add the widget script, set your callbacks and call createOrder. The widget opens the payment page fullscreen inside your own page (no redirect, no popup, no new tab) and watches the order for you.',
       blocks: [{ label: 'index.html', code: R`<script src="${BASE}/hamropay-pay.js"></script>
 
 <button onclick="payNow()">Pay ₹100</button>
@@ -45,7 +45,7 @@
   }
 </script>` }],
       notes: [
-        ['info', 'createOrder opens a 430×700 popup <b>immediately</b> on click (so browsers do not block it) and then points it at the payment page. If popups are blocked it falls back to opening the payment page in the same tab. In that case use <code>redirect_url</code> flow and verify on return.'],
+        ['info', 'By default <code>createOrder</code> opens the checkout as a <b>fullscreen overlay inside your page</b> (a secure iframe): the customer never leaves your site or app, and it works inside WebViews. The overlay closes by itself when the payment finishes. Pass <code>mode: \'popup\'</code> to use a separate popup window instead.'],
         ['warn', '<b>The widget fails silently on missing input.</b> If <code>hamro_api</code> or <code>amount</code> is missing it only writes to the browser console and no callback fires. Test with DevTools open.'],
         ['bad', 'With the widget, your API key is visible in page source. For a real store, create the order on your server (PHP / Node / Python tabs) and open the returned <code>payment_url</code>.']
       ]
