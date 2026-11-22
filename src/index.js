@@ -4,6 +4,7 @@ const path = require('path');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1);   // Render proxy ke peeche asli client IP (OTP/rate-limit ke liye)
 
 app.use(cors());
 app.use(express.json());
