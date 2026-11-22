@@ -35,7 +35,7 @@ router.get('/', authMiddleware, async (req, res) => {
     const { data: prods } = await supabase.from('store_products').select('id').eq('merchant_id', req.merchant.id);
     return res.json({
       success: true,
-      data: store ? { ...store, url: `${frontendUrl()}/store/${store.slug}` } : null,
+      data: store ? { ...store, customization: undefined, url: `${frontendUrl()}/store/${store.slug}` } : null,
       usage: { products_used: (prods || []).length, products_limit: plan.store_products },
       plan: plan.name
     });
@@ -195,6 +195,106 @@ router.patch('/orders/:code', authMiddleware, async (req, res) => {
   } catch (err) { return bad(res, err.message, 500); }
 });
 
+// ======================= STORE CUSTOMIZATION (merchant apne aap sab badal sakta hai) =======================
+const OPTIONS = {
+  preset: ['classic', 'modern', 'minimal', 'bold', 'soft'],
+  mode: ['light', 'dark', 'auto'],
+  font: ['inter', 'poppins', 'nunito', 'roboto', 'playfair', 'montserrat', 'mono'],
+  radius: ['none', 'sm', 'md', 'lg', 'full'],
+  layout: ['grid', 'list', 'compact'],
+  columns_mobile: [1, 2],
+  card_style: ['flat', 'shadow', 'border'],
+  button_style: ['solid', 'outline', 'gradient'],
+  header_style: ['left', 'center', 'banner'],
+  sort_default: ['newest', 'price_low', 'price_high', 'name']
+};
+const DEFAULT_CUSTOM = {
+  preset: 'classic', mode: 'auto', primary_color: '#ff2d55', accent_color: '#ff7a59', background_color: '#ffffff', text_color: '#111111', card_color: '#f7f7f8',
+  font: 'inter', radius: 'md', layout: 'grid', columns_mobile: 2, card_style: 'shadow', button_style: 'solid', header_style: 'left',
+  button_text: 'Add to cart', hero_title: '', hero_subtitle: '', announcement: '', announcement_color: '#ff2d55', banner_url: '',
+  show_search: true, show_sort: true, show_stock: true, show_description: true, sort_default: 'newest',
+  whatsapp: '', instagram: '', facebook: '', telegram: '', website: '',
+  footer_text: '', shipping_policy: '', return_policy: '', meta_title: '', meta_description: '', hide_branding: false
+};
+const COLOR_KEYS = ['primary_color', 'accent_color', 'background_color', 'text_color', 'card_color', 'announcement_color'];
+const BOOL_KEYS = ['show_search', 'show_sort', 'show_stock', 'show_description', 'hide_branding'];
+const TEXT_MAX = { button_text: 24, hero_title: 80, hero_subtitle: 200, announcement: 160, footer_text: 300, shipping_policy: 1000, return_policy: 1000, meta_title: 70, meta_description: 160 };
+const URL_KEYS = ['banner_url', 'website'];
+
+function cleanCustom(input, plan) {
+  const out = {};
+  for (const [k, v] of Object.entries(input || {})) {
+    if (!(k in DEFAULT_CUSTOM)) return { error: `Unknown setting "${k}"` };
+    if (OPTIONS[k]) {
+      if (!OPTIONS[k].includes(v)) return { error: `${k} must be one of: ${OPTIONS[k].join(', ')}` };
+      out[k] = v;
+    } else if (COLOR_KEYS.includes(k)) {
+      if (!/^#[0-9a-fA-F]{6}$/.test(String(v))) return { error: `${k} must be a hex color like #ff2d55` };
+      out[k] = String(v).toLowerCase();
+    } else if (BOOL_KEYS.includes(k)) {
+      if (typeof v !== 'boolean') return { error: `${k} must be true or false` };
+      if (k === 'hide_branding' && v && !plan.branding) return { error: `Hiding HamroPay branding is available from the ADVANCE plan (you are on ${plan.name}).`, code: 'PLAN_FEATURE' };
+      out[k] = v;
+    } else if (URL_KEYS.includes(k)) {
+      if (v && !isUrl(v)) return { error: `${k} must be a valid http(s) URL` };
+      out[k] = v || '';
+    } else if (['whatsapp'].includes(k)) {
+      const d = String(v || '').replace(/[^\d]/g, '');
+      if (v && (d.length < 8 || d.length > 15)) return { error: 'WhatsApp must be a phone number with country code' };
+      out[k] = d;
+    } else if (['instagram', 'facebook', 'telegram'].includes(k)) {
+      const h = String(v || '').trim();
+      if (h && !(isUrl(h) || /^@?[A-Za-z0-9._]{2,40}$/.test(h))) return { error: `${k} must be a profile URL or @handle` };
+      out[k] = h;
+    } else if (k in TEXT_MAX) {
+      const t = typeof v === 'string' ? v.trim() : '';
+      if (typeof v !== 'string' || t.length > TEXT_MAX[k]) return { error: `${k} must be text of at most ${TEXT_MAX[k]} characters` };
+      out[k] = t;
+    }
+  }
+  return { value: out };
+}
+
+const effectiveCustom = (stored, plan) => {
+  const c = { ...DEFAULT_CUSTOM, ...(stored || {}) };
+  if (!plan.branding) c.hide_branding = false;          // downgrade ke baad bhi branding wapas
+  return c;
+};
+
+router.get('/customize', authMiddleware, async (req, res) => {
+  try {
+    const store = await myStore(req.merchant.id);
+    if (!store) return bad(res, 'Create your store first', 400, { code: 'NO_STORE' });
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    return res.json({ success: true, data: { customization: effectiveCustom(store.customization, plan), defaults: DEFAULT_CUSTOM, options: OPTIONS, text_limits: TEXT_MAX, can_hide_branding: !!plan.branding } });
+  } catch (err) { return bad(res, err.message, 500); }
+});
+
+// Partial update: sirf bheje hue keys badalte hain
+router.put('/customize', authMiddleware, async (req, res) => {
+  try {
+    const store = await myStore(req.merchant.id);
+    if (!store) return bad(res, 'Create your store first', 400, { code: 'NO_STORE' });
+    const { plan } = await P.getMerchantPlan(req.merchant.id);
+    const c = cleanCustom(req.body || {}, plan);
+    if (c.error) return bad(res, c.error, c.code ? 403 : 400, c.code ? { code: c.code } : {});
+    if (!Object.keys(c.value).length) return bad(res, 'Nothing to update');
+    const merged = { ...(store.customization || {}), ...c.value };
+    const { data, error } = await supabase.from('stores').update({ customization: merged }).eq('id', store.id).select().single();
+    if (error) throw error;
+    return res.json({ success: true, message: 'Store design saved', data: { customization: effectiveCustom(data.customization, plan) } });
+  } catch (err) { return bad(res, err.message, 500); }
+});
+
+router.delete('/customize', authMiddleware, async (req, res) => {
+  try {
+    const store = await myStore(req.merchant.id);
+    if (!store) return bad(res, 'Create your store first', 400, { code: 'NO_STORE' });
+    await supabase.from('stores').update({ customization: {} }).eq('id', store.id);
+    return res.json({ success: true, message: 'Store design reset to default', data: { customization: DEFAULT_CUSTOM } });
+  } catch (err) { return bad(res, err.message, 500); }
+});
+
 // ======================= PUBLIC (customer) =======================
 
 async function publicStore(slug) {
@@ -208,9 +308,11 @@ router.get('/public/:slug', async (req, res) => {
     if (!store) return bad(res, 'Store not found', 404);
     const { data: prods } = await supabase.from('store_products').select('*').eq('store_id', store.id).eq('is_active', true).order('created_at', { ascending: false });
     const { data: m } = await supabase.from('merchants').select('name').eq('id', store.merchant_id).maybeSingle();
+    const { plan: ownerPlan } = await P.getMerchantPlan(store.merchant_id);
     return res.json({
       success: true,
       data: {
+        customization: effectiveCustom(store.customization, ownerPlan),
         store: { name: store.name, slug: store.slug, description: store.description, logo_url: store.logo_url, contact_phone: store.contact_phone || null, merchant_name: m ? m.name : '' },
         products: (prods || []).map((p) => ({ id: p.id, name: p.name, description: p.description, price: Number(p.price), image_url: p.image_url, in_stock: p.stock === null || p.stock === undefined || Number(p.stock) > 0, stock: p.stock === undefined ? null : p.stock }))
       }
