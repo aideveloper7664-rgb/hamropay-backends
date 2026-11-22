@@ -101,6 +101,12 @@ function cleanProduct(b, plan, { partial }) {
     if (b.stock === null || b.stock === '') out.stock = null;
     else { const st = Number(b.stock); if (!Number.isInteger(st) || st < 0 || st > 1000000) return { error: 'Stock must be a whole number (or empty for unlimited)' }; out.stock = st; }
   }
+  if (b.delivery_link !== undefined) {
+    const l = typeof b.delivery_link === 'string' ? b.delivery_link.trim() : '';
+    if (l && !(isUrl(l) || (l.length <= 1000 && /^https?:\/\//i.test(l)))) return { error: 'delivery_link must be a valid http(s) URL' };
+    out.delivery_link = l || null;
+  }
+  if (b.delivery_note !== undefined) out.delivery_note = str(b.delivery_note, 500) || null;
   if (b.is_active !== undefined) out.is_active = !!b.is_active;
   return { value: out };
 }
@@ -147,12 +153,20 @@ async function applyPaid(order) {
   const { data: claimed } = await supabase.from('store_orders').update({ status: 'paid', paid_at: new Date().toISOString() })
     .eq('order_code', order.order_code).eq('status', 'pending').select();
   if (!claimed || !claimed.length) return;
+  const deliveries = [];
+  let allDigital = (order.items || []).length > 0;
   for (const it of order.items || []) {
-    const { data: p } = await supabase.from('store_products').select('id, stock').eq('id', it.product_id).maybeSingle();
+    const { data: p } = await supabase.from('store_products').select('*').eq('id', it.product_id).maybeSingle();
     if (p && p.stock !== null && p.stock !== undefined) {
       await supabase.from('store_products').update({ stock: Math.max(0, Number(p.stock) - Number(it.qty)) }).eq('id', p.id);
     }
+    if (p && p.delivery_link) deliveries.push({ product_id: p.id, name: it.name, link: p.delivery_link, note: p.delivery_note || null });
+    else allDigital = false;
   }
+  // Paid hone par link order me save (baad me product badle/delete ho to bhi customer ko mile)
+  const patch = { deliveries };
+  if (allDigital) patch.fulfilment = 'delivered';          // sab digital -> turant delivered
+  await supabase.from('store_orders').update(patch).eq('order_code', order.order_code);
 }
 
 async function syncOrder(order, { evaluate = false } = {}) {
@@ -314,7 +328,7 @@ router.get('/public/:slug', async (req, res) => {
       data: {
         customization: effectiveCustom(store.customization, ownerPlan),
         store: { name: store.name, slug: store.slug, description: store.description, logo_url: store.logo_url, contact_phone: store.contact_phone || null, merchant_name: m ? m.name : '' },
-        products: (prods || []).map((p) => ({ id: p.id, name: p.name, description: p.description, price: Number(p.price), image_url: p.image_url, in_stock: p.stock === null || p.stock === undefined || Number(p.stock) > 0, stock: p.stock === undefined ? null : p.stock }))
+        products: (prods || []).map((p) => ({ id: p.id, name: p.name, description: p.description, price: Number(p.price), image_url: p.image_url, is_digital: !!p.delivery_link, in_stock: p.stock === null || p.stock === undefined || Number(p.stock) > 0, stock: p.stock === undefined ? null : p.stock }))
       }
     });
   } catch (err) { return bad(res, err.message, 500); }
@@ -407,7 +421,7 @@ router.get('/public/:slug/order/:code', async (req, res) => {
     const f = await syncOrder(o, { evaluate: true });
     const { data: fresh } = await supabase.from('store_orders').select('*').eq('order_code', o.order_code).maybeSingle();
     const x = fresh || f;
-    return res.json({ success: true, data: { order_code: x.order_code, status: x.status, fulfilment: x.fulfilment, items: x.items, total: Number(x.total), customer_name: x.customer_name, created_at: x.created_at, paid_at: x.paid_at || null, payment_url: x.status === 'pending' ? `${frontendUrl()}/pay/${x.session_id}` : null } });
+    return res.json({ success: true, data: { order_code: x.order_code, status: x.status, fulfilment: x.fulfilment, items: x.items, total: Number(x.total), customer_name: x.customer_name, created_at: x.created_at, paid_at: x.paid_at || null, deliveries: x.status === 'paid' ? (x.deliveries || []) : [], payment_url: x.status === 'pending' ? `${frontendUrl()}/pay/${x.session_id}` : null } });
   } catch (err) { return bad(res, err.message, 500); }
 });
 
